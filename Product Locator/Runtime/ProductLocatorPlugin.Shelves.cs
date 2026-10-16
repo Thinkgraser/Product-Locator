@@ -10,6 +10,9 @@ using UnityEngine.SceneManagement;
 
 public sealed partial class ProductLocatorPlugin
 {
+    private static readonly Vector3 EscalatorTopLanding = new Vector3(134.638f, 9.263f, 233.134f);
+    private static readonly Vector3 EscalatorBottomLanding = new Vector3(137.509f, 1.484f, 246.541f);
+
     private void RefreshShelfTargets()
     {
         if (_activeTargets.Count == 0)
@@ -46,6 +49,7 @@ public sealed partial class ProductLocatorPlugin
             StopCoroutine(_shelfRefreshRoutine);
         Dictionary<ProductType, int?> limits = new Dictionary<ProductType, int?>();
         Dictionary<ProductType, Color?> colors = new Dictionary<ProductType, Color?>();
+        Dictionary<ProductType, float?> backgroundOpacities = new Dictionary<ProductType, float?>();
         Dictionary<ProductType, bool> includeEmptyShelves = new Dictionary<ProductType, bool>();
         for (int i = 0; i < targetTypes.Count; i++)
         {
@@ -58,16 +62,20 @@ public sealed partial class ProductLocatorPlugin
             Color? markerColor;
             colors[targetTypes[i]] = _activeTargetColors.TryGetValue(targetTypes[i], out markerColor)
                 ? markerColor : (Color?)null;
+            float? backgroundOpacity;
+            backgroundOpacities[targetTypes[i]] = _activeTargetBackgroundOpacities.TryGetValue(targetTypes[i], out backgroundOpacity)
+                ? backgroundOpacity : (float?)null;
             bool includeEmpty;
             includeEmptyShelves[targetTypes[i]] = _activeTargetIncludeEmptyShelves.TryGetValue(targetTypes[i], out includeEmpty) && includeEmpty;
         }
         _shelfRefreshRoutine = StartCoroutine(RefreshShelfTargetsIncrementally(
-            new List<ProductType>(targetTypes), limits, colors, includeEmptyShelves));
+            new List<ProductType>(targetTypes), limits, colors, backgroundOpacities, includeEmptyShelves));
         _nextRefresh = Time.unscaledTime + 1.5f;
     }
 
     private IEnumerator RefreshShelfTargetsIncrementally(List<ProductType> targetTypes,
         Dictionary<ProductType, int?> limits, Dictionary<ProductType, Color?> colors,
+        Dictionary<ProductType, float?> backgroundOpacities,
         Dictionary<ProductType, bool> includeEmptyShelves)
     {
         float scanStartedAt = Time.unscaledTime;
@@ -125,7 +133,7 @@ public sealed partial class ProductLocatorPlugin
                     }
 
                     ShelfIconTarget target = CreateShelfIconTarget(shelf, bounds, icon, iconsOnShelf++, product.Data.type, colors);
-                    refreshedIndex[product.Data.type].Add(CreateShelfIconTarget(shelf, bounds, icon, 0,
+                    AddToShelfIndex(refreshedIndex, CreateShelfIconTarget(shelf, bounds, icon, 0,
                         product.Data.type, indexColors));
                     AddShelfIconTarget(target, limits, closestOrigin, refreshedTargets, limitedTargets, limitedDistances);
                 }
@@ -159,7 +167,7 @@ public sealed partial class ProductLocatorPlugin
                                 ShelfIconTarget indexedEmpty = CreateShelfIconTarget(shelf, bounds, icon, 0,
                                     assignedType, indexColors);
                                 indexedEmpty.IsEmptyShelf = true;
-                                refreshedIndex[assignedType].Add(indexedEmpty);
+                                AddToShelfIndex(refreshedIndex, indexedEmpty);
                                 AddShelfIconTarget(target, limits, closestOrigin, refreshedTargets,
                                     limitedTargets, limitedDistances);
                             }
@@ -319,6 +327,16 @@ public sealed partial class ProductLocatorPlugin
     private bool CacheShelves()
     {
         Shelf[] foundShelves = FindObjectsByType<Shelf>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+        // Keep the scene scan canonical in case the same shelf is exposed twice.
+        HashSet<Shelf> uniqueShelves = new HashSet<Shelf>();
+        List<Shelf> uniqueResults = new List<Shelf>(foundShelves.Length);
+        for (int i = 0; i < foundShelves.Length; i++)
+        {
+            Shelf shelf = foundShelves[i];
+            if (shelf != null && uniqueShelves.Add(shelf))
+                uniqueResults.Add(shelf);
+        }
+        foundShelves = uniqueResults.ToArray();
         bool changed = foundShelves.Length != _shelves.Length;
         if (!changed)
         {
@@ -459,6 +477,12 @@ public sealed partial class ProductLocatorPlugin
         {
             targets = new List<ShelfIconTarget>();
             index[target.ProductType] = targets;
+        }
+        for (int i = 0; i < targets.Count; i++)
+        {
+            ShelfIconTarget existing = targets[i];
+            if (existing.Shelf == target.Shelf && existing.IsEmptyShelf == target.IsEmptyShelf)
+                return;
         }
         targets.Add(target);
     }
@@ -830,15 +854,16 @@ public sealed partial class ProductLocatorPlugin
                     continue;
 
                 Vector3 productPosition = GetProductPosition(product);
-                float distance = (productPosition - origin).sqrMagnitude;
+                bool sameFloor = Mathf.Abs(productPosition.y - origin.y) <= sameFloorHeightTolerance;
+                Vector3 distanceOrigin = sameFloor ? origin : GetFloorLanding(productPosition);
+                float distance = (productPosition - distanceOrigin).sqrMagnitude;
                 if (distance < bestAnyFloorDistance)
                 {
                     bestAnyFloorDistance = distance;
                     nearestAnyFloor = product.Data.type;
                 }
 
-                if (Mathf.Abs(productPosition.y - origin.y) <= sameFloorHeightTolerance &&
-                    distance < bestSameFloorDistance)
+                if (sameFloor && distance < bestSameFloorDistance)
                 {
                     bestSameFloorDistance = distance;
                     nearestSameFloor = product.Data.type;
@@ -847,6 +872,137 @@ public sealed partial class ProductLocatorPlugin
         }
 
         return preferCurrentFloor ? nearestSameFloor ?? nearestAnyFloor : nearestAnyFloor;
+    }
+
+    private void UpdateApiDisplayedTargets()
+    {
+        long requestVersion = ProductLocatorApi.GetRequestVersion();
+        if (requestVersion == _apiProductRequestVersion)
+            return;
+
+        _apiDisplayedTargets.Clear();
+        _apiRequestSources.Clear();
+        _apiRequestProducts.Clear();
+        ProductLocatorApi.GetRequestSources(_apiRequestSources);
+        for (int sourceIndex = 0; sourceIndex < _apiRequestSources.Count; sourceIndex++)
+        {
+            string source = _apiRequestSources[sourceIndex];
+            ProductLocatorApi.GetRequestedProductsForSource(source, _apiRequestProducts);
+            int? productLimit = ProductLocatorApi.GetMaxProductsPerSource(source);
+            if (!productLimit.HasValue)
+            {
+                for (int i = 0; i < _apiRequestProducts.Count; i++)
+                    _apiDisplayedTargets.Add(_apiRequestProducts[i]);
+                continue;
+            }
+
+            List<ProductType> closestProducts = FindClosestAvailableProducts(
+                _apiRequestProducts, productLimit.Value, true);
+            for (int i = 0; i < closestProducts.Count; i++)
+                _apiDisplayedTargets.Add(closestProducts[i]);
+        }
+
+        _apiProductRequestVersion = requestVersion;
+    }
+
+    private List<ProductType> FindClosestAvailableProducts(IList<ProductType> candidates,
+        int maxProducts, bool preferCurrentFloor)
+    {
+        List<ProductType> result = new List<ProductType>();
+        if (candidates == null || candidates.Count == 0 || maxProducts < 1)
+            return result;
+
+        HashSet<ProductType> candidateSet = new HashSet<ProductType>(candidates);
+        Dictionary<ProductType, float> anyFloorDistances = new Dictionary<ProductType, float>();
+        Dictionary<ProductType, float> sameFloorDistances = new Dictionary<ProductType, float>();
+        Camera camera = Camera.main;
+        Vector3 origin = camera != null ? camera.transform.position : Vector3.zero;
+        const float sameFloorHeightTolerance = 2.5f;
+
+        if (_shelfIndexReady)
+        {
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                ProductType type = candidates[i];
+                List<ShelfIconTarget> indexed;
+                if (!_shelfTargetIndex.TryGetValue(type, out indexed))
+                    continue;
+                for (int targetIndex = 0; targetIndex < indexed.Count; targetIndex++)
+                {
+                    ShelfIconTarget target = indexed[targetIndex];
+                    if (target.IsEmptyShelf || target.Shelf == null || !target.Shelf.isActiveAndEnabled ||
+                        !target.Shelf.gameObject.activeInHierarchy)
+                        continue;
+                    RecordProductDistance(type, target.Bounds.center, origin, sameFloorHeightTolerance,
+                        anyFloorDistances, sameFloorDistances);
+                }
+            }
+        }
+        else
+        {
+            for (int shelfIndex = 0; shelfIndex < _shelves.Length; shelfIndex++)
+            {
+                Shelf shelf = _shelves[shelfIndex];
+                if (shelf == null || !shelf.isActiveAndEnabled || !shelf.gameObject.activeInHierarchy ||
+                    !shelf.gameObject.scene.IsValid())
+                    continue;
+
+                List<Product> available = shelf.AvailableProducts();
+                if (available == null)
+                    continue;
+                for (int productIndex = 0; productIndex < available.Count; productIndex++)
+                {
+                    Product product = available[productIndex];
+                    if (product == null || !product.isActiveAndEnabled || product.Data == null ||
+                        !candidateSet.Contains(product.Data.type))
+                        continue;
+                    RecordProductDistance(product.Data.type, GetProductPosition(product), origin,
+                        sameFloorHeightTolerance, anyFloorDistances, sameFloorDistances);
+                }
+            }
+        }
+
+        List<ProductType> ranked = new List<ProductType>(anyFloorDistances.Keys);
+        ranked.Sort((first, second) =>
+        {
+            float firstDistance;
+            float secondDistance;
+            int firstFloor = preferCurrentFloor && sameFloorDistances.ContainsKey(first) ? 0 : 1;
+            int secondFloor = preferCurrentFloor && sameFloorDistances.ContainsKey(second) ? 0 : 1;
+            if (firstFloor != secondFloor)
+                return firstFloor.CompareTo(secondFloor);
+            Dictionary<ProductType, float> distances = firstFloor == 0 ? sameFloorDistances : anyFloorDistances;
+            distances.TryGetValue(first, out firstDistance);
+            distances.TryGetValue(second, out secondDistance);
+            int distanceOrder = firstDistance.CompareTo(secondDistance);
+            return distanceOrder != 0 ? distanceOrder : first.CompareTo(second);
+        });
+
+        int resultCount = Mathf.Min(maxProducts, ranked.Count);
+        for (int i = 0; i < resultCount; i++)
+            result.Add(ranked[i]);
+        return result;
+    }
+
+    private static void RecordProductDistance(ProductType type, Vector3 position, Vector3 origin,
+        float sameFloorHeightTolerance, Dictionary<ProductType, float> anyFloorDistances,
+        Dictionary<ProductType, float> sameFloorDistances)
+    {
+        bool sameFloor = Mathf.Abs(position.y - origin.y) <= sameFloorHeightTolerance;
+        Vector3 distanceOrigin = sameFloor ? origin : GetFloorLanding(position);
+        float distance = (position - distanceOrigin).sqrMagnitude;
+        float previousDistance;
+        if (!anyFloorDistances.TryGetValue(type, out previousDistance) || distance < previousDistance)
+            anyFloorDistances[type] = distance;
+        if (sameFloor && (!sameFloorDistances.TryGetValue(type, out previousDistance) || distance < previousDistance))
+            sameFloorDistances[type] = distance;
+    }
+
+    private static Vector3 GetFloorLanding(Vector3 position)
+    {
+        float topFloorDifference = Mathf.Abs(position.y - EscalatorTopLanding.y);
+        float bottomFloorDifference = Mathf.Abs(position.y - EscalatorBottomLanding.y);
+        return topFloorDifference <= bottomFloorDifference ? EscalatorTopLanding : EscalatorBottomLanding;
     }
 
     private bool HasAvailableShelfStock(ProductType productType)
@@ -894,6 +1050,23 @@ public sealed partial class ProductLocatorPlugin
             Color? secondColor;
             if (!first.TryGetValue(productTypes[i], out firstColor) ||
                 !second.TryGetValue(productTypes[i], out secondColor) || firstColor != secondColor)
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool AreTargetBackgroundOpacitiesEqual(
+        Dictionary<ProductType, float?> first,
+        Dictionary<ProductType, float?> second,
+        IList<ProductType> productTypes)
+    {
+        for (int i = 0; i < productTypes.Count; i++)
+        {
+            float? firstOpacity;
+            float? secondOpacity;
+            if (!first.TryGetValue(productTypes[i], out firstOpacity) ||
+                !second.TryGetValue(productTypes[i], out secondOpacity) || firstOpacity != secondOpacity)
                 return false;
         }
 

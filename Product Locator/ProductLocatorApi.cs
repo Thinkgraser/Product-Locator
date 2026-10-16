@@ -2,16 +2,29 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 
+/// <summary>Optional settings for one product or an entire source request.</summary>
+public sealed class ProductLocatorHighlightOptions
+{
+    /// <summary>Maximum nearest shelves per product. Null shows all matching shelves.</summary>
+    public int? MaxShelvesPerProduct { get; set; }
+
+    /// <summary>Maximum nearest product types from this source. Null shows all requested products.</summary>
+    public int? MaxProductsPerSource { get; set; }
+
+    /// <summary>Optional marker border color. Null inherits the user's configured color.</summary>
+    public Color? MarkerColor { get; set; }
+
+    /// <summary>Optional opacity of the dark marker background, from 0 (transparent) to 1 (opaque). Null inherits the user's configured opacity.</summary>
+    public float? BackgroundOpacity { get; set; }
+
+    /// <summary>Whether to show empty labeled shelves. Null inherits the user's configuration.</summary>
+    public bool? IncludeEmptyShelves { get; set; }
+}
+
 /// <summary>
 /// Public API for requesting product shelf highlights and querying stocked products.
 /// Unity-backed query and refresh methods must be called from Unity's main thread.
 /// </summary>
-public enum ProductLocatorHighlightMode
-{
-    Closest,
-    All
-}
-
 public static class ProductLocatorApi
 {
     public const string PluginGuid = "thinkgraser.megastore.productlocator";
@@ -22,7 +35,9 @@ public static class ProductLocatorApi
         public readonly List<ProductType> Products = new List<ProductType>();
         public readonly Dictionary<ProductType, int?> Limits = new Dictionary<ProductType, int?>();
         public readonly Dictionary<ProductType, Color?> Colors = new Dictionary<ProductType, Color?>();
+        public readonly Dictionary<ProductType, float?> BackgroundOpacities = new Dictionary<ProductType, float?>();
         public readonly Dictionary<ProductType, bool?> IncludeEmptyShelves = new Dictionary<ProductType, bool?>();
+        public int? MaxProductsPerSource;
     }
 
     private static readonly Dictionary<string, HighlightRequest> Requests =
@@ -33,6 +48,13 @@ public static class ProductLocatorApi
     private static Func<ProductType, bool> AvailabilityResolver;
     private static Func<ProductType, bool> ProductRefreshHandler;
     private static bool PickerOpen;
+    private static long RequestVersion;
+
+    internal static long GetRequestVersion()
+    {
+        lock (Sync)
+            return RequestVersion;
+    }
 
     /// <summary>True while the locator plugin has registered its game services.</summary>
     public static bool IsReady
@@ -60,70 +82,20 @@ public static class ProductLocatorApi
             PickerOpen = isOpen;
     }
 
-    /// <summary>Adds or updates one product for this source without replacing its other products.</summary>
-    public static void AddHighlight(ProductType productType, string source = "External")
-    {
-        AddHighlight(productType, ProductLocatorHighlightMode.All, source, null);
-    }
-
-    /// <summary>Adds or updates one product and its shelf limit without replacing other products.</summary>
-    public static void AddHighlight(ProductType productType, ProductLocatorHighlightMode mode, string source = "External")
-    {
-        AddHighlight(productType, mode, source, null);
-    }
-
-    /// <summary>Adds or updates one product with an optional product-specific border color.</summary>
-    public static void AddHighlight(ProductType productType, ProductLocatorHighlightMode mode,
-        string source, Color? markerColor)
-    {
-        AddHighlight(productType, mode == ProductLocatorHighlightMode.Closest ? 1 : (int?)null, source, markerColor, null);
-    }
-
-    /// <summary>Adds or updates one product and optionally overrides empty labeled-shelf markers for it.</summary>
-    public static void AddHighlight(ProductType productType, ProductLocatorHighlightMode mode,
-        string source, Color? markerColor, bool? includeEmptyShelves)
-    {
-        AddHighlight(productType, mode == ProductLocatorHighlightMode.Closest ? 1 : (int?)null,
-            source, markerColor, includeEmptyShelves);
-    }
-
-    /// <summary>Adds or updates one product and sets whether its empty labeled shelves are shown.</summary>
-    public static void AddHighlight(ProductType productType, ProductLocatorHighlightMode mode,
-        string source, bool includeEmptyShelves)
-    {
-        AddHighlight(productType, mode, source, null, includeEmptyShelves);
-    }
-
-    /// <summary>Adds or updates one product using all matching shelves and a product-specific border color.</summary>
-    public static void AddHighlight(ProductType productType, Color markerColor, string source = "External")
-    {
-        AddHighlight(productType, (int?)null, source, markerColor);
-    }
-
-    /// <summary>Adds or updates one product with a shelf limit and optional product-specific border color.</summary>
-    public static void AddHighlight(ProductType productType, int? maxShelvesPerProduct,
-        string source, Color? markerColor = null)
-    {
-        AddHighlight(productType, maxShelvesPerProduct, source, markerColor, null);
-    }
-
-    /// <summary>Adds or updates one product and sets whether its empty labeled shelves are shown.</summary>
-    public static void AddHighlight(ProductType productType, int? maxShelvesPerProduct,
-        string source, bool includeEmptyShelves)
-    {
-        AddHighlight(productType, maxShelvesPerProduct, source, null, includeEmptyShelves);
-    }
-
     /// <summary>
-    /// Adds or updates one product with a shelf limit, optional border color, and optional empty-shelf setting.
-    /// A null empty-shelf setting inherits Product Locator's configuration.
+    /// Adds or updates one product for this source without replacing its other products.
+    /// Null options use unlimited shelves and inherit the user's color and empty-shelf settings.
+    /// A MaxProductsPerSource value in options applies to the source's complete product request.
     /// </summary>
-    public static void AddHighlight(ProductType productType, int? maxShelvesPerProduct,
-        string source, Color? markerColor, bool? includeEmptyShelves)
+    public static void AddHighlight(ProductType productType, string source = "External",
+        ProductLocatorHighlightOptions options = null)
     {
-        if (maxShelvesPerProduct.HasValue && maxShelvesPerProduct.Value < 1)
-            throw new ArgumentOutOfRangeException("maxShelvesPerProduct", "Use null for unlimited or a positive shelf count.");
-
+        int? maxShelvesPerProduct = options != null ? options.MaxShelvesPerProduct : (int?)null;
+        int? maxProductsPerSource = options != null ? options.MaxProductsPerSource : (int?)null;
+        float? backgroundOpacity = options != null ? options.BackgroundOpacity : (float?)null;
+        ValidateShelfLimit(maxShelvesPerProduct);
+        ValidateProductLimit(maxProductsPerSource);
+        ValidateBackgroundOpacity(backgroundOpacity);
         source = NormalizeSource(source);
         lock (Sync)
         {
@@ -134,84 +106,49 @@ public static class ProductLocatorApi
                 Requests[source] = request;
                 RequestOrder.Add(source);
             }
+            int? previousLimit;
+            Color? previousColor;
+            float? previousBackgroundOpacity;
+            bool? previousIncludeEmpty;
+            request.Limits.TryGetValue(productType, out previousLimit);
+            request.Colors.TryGetValue(productType, out previousColor);
+            request.BackgroundOpacities.TryGetValue(productType, out previousBackgroundOpacity);
+            request.IncludeEmptyShelves.TryGetValue(productType, out previousIncludeEmpty);
+            bool changed = !request.Limits.ContainsKey(productType) || previousLimit != maxShelvesPerProduct ||
+                previousColor != (options != null ? options.MarkerColor : (Color?)null) ||
+                previousBackgroundOpacity != backgroundOpacity ||
+                previousIncludeEmpty != (options != null ? options.IncludeEmptyShelves : (bool?)null) ||
+                (options != null && request.MaxProductsPerSource != maxProductsPerSource);
             if (!request.Limits.ContainsKey(productType))
                 request.Products.Add(productType);
             request.Limits[productType] = maxShelvesPerProduct;
-            request.Colors[productType] = markerColor;
-            request.IncludeEmptyShelves[productType] = includeEmptyShelves;
+            request.Colors[productType] = options != null ? options.MarkerColor : (Color?)null;
+            request.BackgroundOpacities[productType] = backgroundOpacity;
+            request.IncludeEmptyShelves[productType] = options != null ? options.IncludeEmptyShelves : (bool?)null;
+            if (options != null)
+                request.MaxProductsPerSource = maxProductsPerSource;
+            if (changed)
+                RequestVersion++;
         }
     }
 
     /// <summary>
-    /// Atomically replaces this caller's highlights with the supplied products.
-    /// Passing an empty or null sequence clears this caller's request.
-    /// </summary>
-    public static void SetHighlights(string source, IEnumerable<ProductType> productTypes)
-    {
-        SetHighlights(source, productTypes, (int?)null);
-    }
-
-    /// <summary>Atomically replaces this caller's highlights and selects one or all matching shelves per product.</summary>
-    public static void SetHighlights(string source, IEnumerable<ProductType> productTypes, ProductLocatorHighlightMode mode)
-    {
-        SetHighlights(source, productTypes, mode == ProductLocatorHighlightMode.Closest ? 1 : (int?)null);
-    }
-
-    /// <summary>Atomically replaces highlights, selecting one or all shelves and an optional source border color.</summary>
-    public static void SetHighlights(string source, IEnumerable<ProductType> productTypes,
-        ProductLocatorHighlightMode mode, Color? markerColor)
-    {
-        SetHighlights(source, productTypes, mode == ProductLocatorHighlightMode.Closest ? 1 : (int?)null, markerColor, null);
-    }
-
-    /// <summary>Replaces this source's requests with products using the given color and empty-shelf setting.</summary>
-    public static void SetHighlights(string source, IEnumerable<ProductType> productTypes,
-        ProductLocatorHighlightMode mode, Color? markerColor, bool? includeEmptyShelves)
-    {
-        SetHighlights(source, productTypes, mode == ProductLocatorHighlightMode.Closest ? 1 : (int?)null,
-            markerColor, includeEmptyShelves);
-    }
-
-    /// <summary>Replaces this source's product list and sets whether empty labeled shelves are shown.</summary>
-    public static void SetHighlights(string source, IEnumerable<ProductType> productTypes,
-        ProductLocatorHighlightMode mode, bool includeEmptyShelves)
-    {
-        SetHighlights(source, productTypes, mode, null, includeEmptyShelves);
-    }
-
-    /// <summary>
-    /// Atomically replaces this caller's highlights and limits the number of shelves shown
-    /// per product type. Use null for no limit; limited results are chosen nearest-first.
-    /// </summary>
-    public static void SetHighlights(string source, IEnumerable<ProductType> productTypes, int? maxShelvesPerProduct)
-    {
-        SetHighlights(source, productTypes, maxShelvesPerProduct, null);
-    }
-
-    /// <summary>
-    /// Atomically replaces this caller's highlights, limits shelves per product, and optionally sets the
-    /// border color for this source. A null color uses Product Locator's configured marker color.
-    /// If multiple sources request the same product, the first registered source supplies its color.
+    /// Atomically replaces this caller's highlights with the supplied products and shared options.
+    /// Passing an empty or null sequence clears this caller's request. Null options use unlimited shelves
+    /// and inherit the user's color and empty-shelf settings. MaxProductsPerSource selects that many
+    /// nearest stocked product types from this source's list.
     /// </summary>
     public static void SetHighlights(string source, IEnumerable<ProductType> productTypes,
-        int? maxShelvesPerProduct, Color? markerColor)
+        ProductLocatorHighlightOptions options = null)
     {
-        SetHighlights(source, productTypes, maxShelvesPerProduct, markerColor, null);
-    }
-
-    /// <summary>Replaces this source's product list and sets whether empty labeled shelves are shown.</summary>
-    public static void SetHighlights(string source, IEnumerable<ProductType> productTypes,
-        int? maxShelvesPerProduct, bool includeEmptyShelves)
-    {
-        SetHighlights(source, productTypes, maxShelvesPerProduct, null, includeEmptyShelves);
-    }
-
-    /// <summary>Replaces this source's requests with a shelf limit, optional color, and optional empty-shelf setting.</summary>
-    public static void SetHighlights(string source, IEnumerable<ProductType> productTypes,
-        int? maxShelvesPerProduct, Color? markerColor, bool? includeEmptyShelves)
-    {
-        if (maxShelvesPerProduct.HasValue && maxShelvesPerProduct.Value < 1)
-            throw new ArgumentOutOfRangeException("maxShelvesPerProduct", "Use null for unlimited or a positive shelf count.");
+        int? maxShelvesPerProduct = options != null ? options.MaxShelvesPerProduct : (int?)null;
+        int? maxProductsPerSource = options != null ? options.MaxProductsPerSource : (int?)null;
+        ValidateShelfLimit(maxShelvesPerProduct);
+        ValidateProductLimit(maxProductsPerSource);
+        Color? markerColor = options != null ? options.MarkerColor : (Color?)null;
+        float? backgroundOpacity = options != null ? options.BackgroundOpacity : (float?)null;
+        ValidateBackgroundOpacity(backgroundOpacity);
+        bool? includeEmptyShelves = options != null ? options.IncludeEmptyShelves : (bool?)null;
         source = NormalizeSource(source);
         List<ProductType> products = new List<ProductType>();
         if (productTypes != null)
@@ -228,24 +165,81 @@ public static class ProductLocatorApi
         {
             if (products.Count == 0)
             {
-                Requests.Remove(source);
-                RequestOrder.Remove(source);
+                if (Requests.Remove(source))
+                {
+                    RequestOrder.Remove(source);
+                    RequestVersion++;
+                }
                 return;
             }
 
-            if (!Requests.ContainsKey(source))
+            HighlightRequest previousRequest;
+            bool hadRequest = Requests.TryGetValue(source, out previousRequest);
+            if (!hadRequest)
                 RequestOrder.Add(source);
             HighlightRequest request = new HighlightRequest();
+            request.MaxProductsPerSource = maxProductsPerSource;
             for (int i = 0; i < products.Count; i++)
             {
                 ProductType productType = products[i];
                 request.Products.Add(productType);
                 request.Limits[productType] = maxShelvesPerProduct;
                 request.Colors[productType] = markerColor;
+                request.BackgroundOpacities[productType] = backgroundOpacity;
                 request.IncludeEmptyShelves[productType] = includeEmptyShelves;
             }
+            if (!hadRequest || !RequestsEqual(previousRequest, request))
+                RequestVersion++;
             Requests[source] = request;
         }
+    }
+
+    private static void ValidateShelfLimit(int? maxShelvesPerProduct)
+    {
+        if (maxShelvesPerProduct.HasValue && maxShelvesPerProduct.Value < 1)
+            throw new ArgumentOutOfRangeException("MaxShelvesPerProduct", "Use null for unlimited or a positive shelf count.");
+    }
+
+    private static void ValidateProductLimit(int? maxProductsPerSource)
+    {
+        if (maxProductsPerSource.HasValue && maxProductsPerSource.Value < 1)
+            throw new ArgumentOutOfRangeException("MaxProductsPerSource", "Use null for unlimited or a positive product count.");
+    }
+
+    private static void ValidateBackgroundOpacity(float? backgroundOpacity)
+    {
+        if (backgroundOpacity.HasValue && (float.IsNaN(backgroundOpacity.Value) ||
+            float.IsInfinity(backgroundOpacity.Value) || backgroundOpacity.Value < 0f || backgroundOpacity.Value > 1f))
+            throw new ArgumentOutOfRangeException("BackgroundOpacity", "Use null or an opacity from 0 to 1.");
+    }
+
+    private static bool RequestsEqual(HighlightRequest first, HighlightRequest second)
+    {
+        if (first.MaxProductsPerSource != second.MaxProductsPerSource ||
+            first.Products.Count != second.Products.Count)
+            return false;
+        for (int i = 0; i < first.Products.Count; i++)
+        {
+            ProductType type = first.Products[i];
+            int? firstLimit;
+            int? secondLimit;
+            Color? firstColor;
+            Color? secondColor;
+            float? firstOpacity;
+            float? secondOpacity;
+            bool? firstEmpty;
+            bool? secondEmpty;
+            if (second.Products[i] != type || !first.Limits.TryGetValue(type, out firstLimit) ||
+                !second.Limits.TryGetValue(type, out secondLimit) || firstLimit != secondLimit ||
+                !first.Colors.TryGetValue(type, out firstColor) || !second.Colors.TryGetValue(type, out secondColor) ||
+                firstColor != secondColor ||
+                !first.BackgroundOpacities.TryGetValue(type, out firstOpacity) ||
+                !second.BackgroundOpacities.TryGetValue(type, out secondOpacity) || firstOpacity != secondOpacity ||
+                !first.IncludeEmptyShelves.TryGetValue(type, out firstEmpty) ||
+                !second.IncludeEmptyShelves.TryGetValue(type, out secondEmpty) || firstEmpty != secondEmpty)
+                return false;
+        }
+        return true;
     }
 
     /// <summary>Removes all highlight requests made by this caller.</summary>
@@ -254,8 +248,36 @@ public static class ProductLocatorApi
         source = NormalizeSource(source);
         lock (Sync)
         {
-            Requests.Remove(source);
-            RequestOrder.Remove(source);
+            if (Requests.Remove(source))
+            {
+                RequestOrder.Remove(source);
+                RequestVersion++;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns whether a source currently requests exactly the supplied product types.
+    /// Product order is ignored. Use this to detect requests removed or edited by another caller.
+    /// </summary>
+    public static bool HasHighlights(string source, IEnumerable<ProductType> productTypes)
+    {
+        List<ProductType> expected = MaterializeDistinct(productTypes);
+        source = NormalizeSource(source);
+        lock (Sync)
+        {
+            HighlightRequest request;
+            if (expected.Count == 0)
+                return !Requests.ContainsKey(source);
+            if (!Requests.TryGetValue(source, out request) || request.Products.Count != expected.Count)
+                return false;
+
+            for (int i = 0; i < expected.Count; i++)
+            {
+                if (!request.Limits.ContainsKey(expected[i]))
+                    return false;
+            }
+            return true;
         }
     }
 
@@ -270,7 +292,9 @@ public static class ProductLocatorApi
                 return false;
             request.Limits.Remove(productType);
             request.Colors.Remove(productType);
+            request.BackgroundOpacities.Remove(productType);
             request.IncludeEmptyShelves.Remove(productType);
+            RequestVersion++;
 
             if (request.Products.Count == 0)
             {
@@ -284,6 +308,7 @@ public static class ProductLocatorApi
     /// <summary>
     /// Finds the closest currently stocked product from the candidate set.
     /// Products on the player's floor are preferred when one is within 2.5 world units vertically.
+    /// Products on another floor are ranked by distance from that floor's escalator landing.
     /// Returns false if the locator is unavailable or none of the candidates is stocked.
     /// Call on Unity's main thread; this inspects the current shelf inventory.
     /// </summary>
@@ -334,6 +359,26 @@ public static class ProductLocatorApi
         return handler != null && handler(productType);
     }
 
+    /// <summary>
+    /// Re-ranks product types for API requests that set MaxProductsPerSource, using the player's current
+    /// position. Call this when the caller wants a new nearest-product selection after the player moves.
+    /// Request changes are ranked automatically; unchanged requests are not periodically re-ranked.
+    /// </summary>
+    public static void RefreshProductSelections()
+    {
+        lock (Sync)
+        {
+            foreach (KeyValuePair<string, HighlightRequest> item in Requests)
+            {
+                if (item.Value.MaxProductsPerSource.HasValue)
+                {
+                    RequestVersion++;
+                    return;
+                }
+            }
+        }
+    }
+
     internal static void RegisterGameServices(
         Func<IList<ProductType>, bool, ProductType?> closestProductResolver,
         Func<ProductType, bool> availabilityResolver,
@@ -379,6 +424,14 @@ public static class ProductLocatorApi
         Dictionary<ProductType, int?> limits, Dictionary<ProductType, Color?> colors,
         Dictionary<ProductType, bool?> includeEmptyShelves)
     {
+        GetRequestedProducts(productTypes, limits, colors, includeEmptyShelves, null);
+    }
+
+    internal static void GetRequestedProducts(List<ProductType> productTypes,
+        Dictionary<ProductType, int?> limits, Dictionary<ProductType, Color?> colors,
+        Dictionary<ProductType, bool?> includeEmptyShelves,
+        Dictionary<ProductType, float?> backgroundOpacities)
+    {
         productTypes.Clear();
         if (limits != null)
             limits.Clear();
@@ -386,6 +439,8 @@ public static class ProductLocatorApi
             colors.Clear();
         if (includeEmptyShelves != null)
             includeEmptyShelves.Clear();
+        if (backgroundOpacities != null)
+            backgroundOpacities.Clear();
         lock (Sync)
         {
             RequestProductScratch.Clear();
@@ -401,9 +456,11 @@ public static class ProductLocatorApi
                     int? requestLimit;
                     Color? requestColor;
                     bool? requestIncludeEmpty;
+                    float? requestBackgroundOpacity;
                     request.Limits.TryGetValue(productType, out requestLimit);
                     request.Colors.TryGetValue(productType, out requestColor);
                     request.IncludeEmptyShelves.TryGetValue(productType, out requestIncludeEmpty);
+                    request.BackgroundOpacities.TryGetValue(productType, out requestBackgroundOpacity);
                     if (RequestProductScratch.Add(productType))
                     {
                         productTypes.Add(productType);
@@ -413,6 +470,8 @@ public static class ProductLocatorApi
                             colors[productType] = requestColor;
                         if (includeEmptyShelves != null)
                             includeEmptyShelves[productType] = requestIncludeEmpty;
+                        if (backgroundOpacities != null)
+                            backgroundOpacities[productType] = requestBackgroundOpacity;
                     }
                     else if (limits != null)
                     {
@@ -424,6 +483,12 @@ public static class ProductLocatorApi
                         else if (requestLimit.Value > existingLimit.Value)
                             limits[productType] = requestLimit;
                     }
+
+                    if (colors != null && !colors[productType].HasValue && requestColor.HasValue)
+                        colors[productType] = requestColor;
+
+                    if (backgroundOpacities != null && !backgroundOpacities[productType].HasValue && requestBackgroundOpacity.HasValue)
+                        backgroundOpacities[productType] = requestBackgroundOpacity;
 
                     if (includeEmptyShelves != null && requestIncludeEmpty.HasValue)
                     {
@@ -458,6 +523,16 @@ public static class ProductLocatorApi
             HighlightRequest request;
             if (Requests.TryGetValue(source, out request))
                 productTypes.AddRange(request.Products);
+        }
+    }
+
+    internal static int? GetMaxProductsPerSource(string source)
+    {
+        source = NormalizeSource(source);
+        lock (Sync)
+        {
+            HighlightRequest request;
+            return Requests.TryGetValue(source, out request) ? request.MaxProductsPerSource : (int?)null;
         }
     }
 

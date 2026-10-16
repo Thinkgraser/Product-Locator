@@ -52,6 +52,7 @@ public sealed partial class ProductLocatorPlugin : BaseUnityPlugin
     private readonly List<ProductType> _apiRequestedTargets = new List<ProductType>();
     private readonly List<string> _apiRequestSources = new List<string>();
     private readonly List<ProductType> _apiRequestProducts = new List<ProductType>();
+    private readonly HashSet<ProductType> _apiDisplayedTargets = new HashSet<ProductType>();
     private readonly List<ProductType> _newTargetRefreshes = new List<ProductType>();
     private readonly Dictionary<ProductType, int?> _activeTargetLimits = new Dictionary<ProductType, int?>();
     private readonly Dictionary<ProductType, int?> _desiredTargetLimits = new Dictionary<ProductType, int?>();
@@ -59,6 +60,9 @@ public sealed partial class ProductLocatorPlugin : BaseUnityPlugin
     private readonly Dictionary<ProductType, Color?> _activeTargetColors = new Dictionary<ProductType, Color?>();
     private readonly Dictionary<ProductType, Color?> _desiredTargetColors = new Dictionary<ProductType, Color?>();
     private readonly Dictionary<ProductType, Color?> _apiRequestedColors = new Dictionary<ProductType, Color?>();
+    private readonly Dictionary<ProductType, float?> _activeTargetBackgroundOpacities = new Dictionary<ProductType, float?>();
+    private readonly Dictionary<ProductType, float?> _desiredTargetBackgroundOpacities = new Dictionary<ProductType, float?>();
+    private readonly Dictionary<ProductType, float?> _apiRequestedBackgroundOpacities = new Dictionary<ProductType, float?>();
     private readonly Dictionary<ProductType, bool> _activeTargetIncludeEmptyShelves = new Dictionary<ProductType, bool>();
     private readonly Dictionary<ProductType, bool> _desiredTargetIncludeEmptyShelves = new Dictionary<ProductType, bool>();
     private readonly Dictionary<ProductType, bool?> _apiRequestedIncludeEmptyShelves = new Dictionary<ProductType, bool?>();
@@ -107,6 +111,9 @@ public sealed partial class ProductLocatorPlugin : BaseUnityPlugin
     private ConfigEntry<bool> _debugLogging;
 
     private readonly List<ProductType> _manualSelections = new List<ProductType>();
+    private readonly Dictionary<string, bool> _apiSourceExpanded =
+        new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+    private bool _manualProductsExpanded = true;
     private ProductType? _activeTarget;
     private string _search = string.Empty;
     private Vector2 _selectedScroll;
@@ -127,6 +134,7 @@ public sealed partial class ProductLocatorPlugin : BaseUnityPlugin
     private Coroutine _shelfWatchRoutine;
     private Coroutine _shelfDiscoveryRoutine;
     private bool _shelfIndexReady;
+    private long _apiProductRequestVersion = -1;
     private Canvas _markerCanvas;
     private readonly List<MarkerView> _markerViews = new List<MarkerView>();
     private GraphicRaycaster[] _computerRaycasters = new GraphicRaycaster[0];
@@ -149,7 +157,9 @@ public sealed partial class ProductLocatorPlugin : BaseUnityPlugin
         _iconSize = Config.Bind("Highlight", "Icon Size", 100,
             new ConfigDescription("Displayed product icon card size in pixels.",
                 new AcceptableValueRange<int>(50, 150)));
-        _backgroundOpacity = Config.Bind("Highlight", "Background Opacity", 0.92f, "Opacity of the dark background behind each product icon.");
+        _backgroundOpacity = Config.Bind("Highlight", "Background Opacity", 0.92f,
+            new ConfigDescription("Opacity of the dark background behind each product icon.",
+                new AcceptableValueRange<float>(0f, 1f)));
         _includeEmptyLabeledShelves = Config.Bind("Highlight", "Include Empty Labeled Shelves", true,
             "Show product markers on empty shelves that still have a product label assigned.");
         _uiScale = Config.Bind("Interface", "UI Scale", 1f,
@@ -205,9 +215,11 @@ public sealed partial class ProductLocatorPlugin : BaseUnityPlugin
         _desiredTargets.Clear();
         _desiredTargetLimits.Clear();
         _desiredTargetColors.Clear();
+        _desiredTargetBackgroundOpacities.Clear();
         _desiredTargetIncludeEmptyShelves.Clear();
         ProductLocatorApi.GetRequestedProducts(_apiRequestedTargets, _apiRequestedLimits,
-            _apiRequestedColors, _apiRequestedIncludeEmptyShelves);
+            _apiRequestedColors, _apiRequestedIncludeEmptyShelves, _apiRequestedBackgroundOpacities);
+        UpdateApiDisplayedTargets();
         if (_manualSelections.Count > 0)
         {
             _desiredTargets.AddRange(_manualSelections);
@@ -215,12 +227,15 @@ public sealed partial class ProductLocatorPlugin : BaseUnityPlugin
             {
                 _desiredTargetLimits[_manualSelections[i]] = null;
                 _desiredTargetColors[_manualSelections[i]] = null;
+                _desiredTargetBackgroundOpacities[_manualSelections[i]] = null;
                 _desiredTargetIncludeEmptyShelves[_manualSelections[i]] = _includeEmptyLabeledShelves.Value;
             }
         }
         for (int i = 0; i < _apiRequestedTargets.Count; i++)
         {
             ProductType productType = _apiRequestedTargets[i];
+            if (!_apiDisplayedTargets.Contains(productType))
+                continue;
             if (_desiredTargets.Contains(productType))
                 continue;
             _desiredTargets.Add(productType);
@@ -228,6 +243,9 @@ public sealed partial class ProductLocatorPlugin : BaseUnityPlugin
             _desiredTargetLimits[productType] = _apiRequestedLimits.TryGetValue(productType, out limit) ? limit : (int?)null;
             Color? markerColor;
             _desiredTargetColors[productType] = _apiRequestedColors.TryGetValue(productType, out markerColor) ? markerColor : (Color?)null;
+            float? backgroundOpacity;
+            _desiredTargetBackgroundOpacities[productType] = _apiRequestedBackgroundOpacities.TryGetValue(productType, out backgroundOpacity)
+                ? backgroundOpacity : (float?)null;
             bool? includeEmpty;
             _desiredTargetIncludeEmptyShelves[productType] =
                 _apiRequestedIncludeEmptyShelves.TryGetValue(productType, out includeEmpty) && includeEmpty.HasValue
@@ -239,6 +257,8 @@ public sealed partial class ProductLocatorPlugin : BaseUnityPlugin
         bool targetListChanged = !AreTargetListsEqual(_activeTargets, _desiredTargets) ||
             !AreTargetLimitsEqual(_activeTargetLimits, _desiredTargetLimits, _desiredTargets) ||
             !AreTargetColorsEqual(_activeTargetColors, _desiredTargetColors, _desiredTargets) ||
+            !AreTargetBackgroundOpacitiesEqual(_activeTargetBackgroundOpacities,
+                _desiredTargetBackgroundOpacities, _desiredTargets) ||
             !AreTargetEmptyShelfSettingsEqual(_activeTargetIncludeEmptyShelves,
                 _desiredTargetIncludeEmptyShelves, _desiredTargets);
         if (desired != _activeTarget || targetListChanged)
@@ -254,11 +274,15 @@ public sealed partial class ProductLocatorPlugin : BaseUnityPlugin
                 int? desiredLimit = _desiredTargetLimits[_desiredTargets[i]];
                 Color? activeColor;
                 Color? desiredColor = _desiredTargetColors[_desiredTargets[i]];
+                float? activeBackgroundOpacity;
+                float? desiredBackgroundOpacity = _desiredTargetBackgroundOpacities[_desiredTargets[i]];
                 bool activeIncludesEmptyShelves;
                 bool desiredIncludesEmptyShelves = _desiredTargetIncludeEmptyShelves[_desiredTargets[i]];
                 if (!_activeTargets.Contains(_desiredTargets[i]) ||
                     !_activeTargetLimits.TryGetValue(_desiredTargets[i], out activeLimit) || activeLimit != desiredLimit ||
                     !_activeTargetColors.TryGetValue(_desiredTargets[i], out activeColor) || activeColor != desiredColor ||
+                    !_activeTargetBackgroundOpacities.TryGetValue(_desiredTargets[i], out activeBackgroundOpacity) ||
+                    activeBackgroundOpacity != desiredBackgroundOpacity ||
                     !_activeTargetIncludeEmptyShelves.TryGetValue(_desiredTargets[i], out activeIncludesEmptyShelves) ||
                     activeIncludesEmptyShelves != desiredIncludesEmptyShelves)
                     _newTargetRefreshes.Add(_desiredTargets[i]);
@@ -276,6 +300,9 @@ public sealed partial class ProductLocatorPlugin : BaseUnityPlugin
             _activeTargetColors.Clear();
             foreach (KeyValuePair<ProductType, Color?> item in _desiredTargetColors)
                 _activeTargetColors[item.Key] = item.Value;
+            _activeTargetBackgroundOpacities.Clear();
+            foreach (KeyValuePair<ProductType, float?> item in _desiredTargetBackgroundOpacities)
+                _activeTargetBackgroundOpacities[item.Key] = item.Value;
             _activeTargetIncludeEmptyShelves.Clear();
             foreach (KeyValuePair<ProductType, bool> item in _desiredTargetIncludeEmptyShelves)
                 _activeTargetIncludeEmptyShelves[item.Key] = item.Value;

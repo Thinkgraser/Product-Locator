@@ -89,28 +89,34 @@ public sealed partial class ProductLocatorPlugin
     private void DrawSelectedProductsPanel()
     {
         GUILayout.BeginVertical(_panelStyle, GUILayout.Width(Ui(340f)), GUILayout.ExpandHeight(true));
-        GUILayout.Label("SELECTED PRODUCTS", _sectionStyle);
-        GUILayout.Label(_manualSelections.Count + " selected", _helpStyle);
-        GUILayout.Space(Ui(10f));
+        if (GUILayout.Button((_manualProductsExpanded ? "▾  " : "▸  ") +
+            "SELECTED PRODUCTS  ·  " + _manualSelections.Count, _buttonStyle,
+            GUILayout.ExpandWidth(true), GUILayout.Height(Ui(42f))))
+            _manualProductsExpanded = !_manualProductsExpanded;
 
         _selectedScroll = GUILayout.BeginScrollView(_selectedScroll, GUILayout.ExpandHeight(true));
-        for (int i = _manualSelections.Count - 1; i >= 0; i--)
+        if (_manualProductsExpanded)
         {
-            ProductType type = _manualSelections[i];
-            ProductData data = GetProductData(type);
-            GUILayout.BeginHorizontal(_tileStyle, GUILayout.Height(Ui(72f)));
-            DrawProductImage(data != null ? data.productSprite : null, Ui(54f));
-            GUILayout.BeginVertical();
-            GUILayout.Label(GetProductName(type, data), _selectedNameStyle);
-            GUILayout.Label(GetProductBrand(data), _brandStyle);
-            GUILayout.EndVertical();
-            if (GUILayout.Button("Remove", _buttonStyle, GUILayout.Width(Ui(92f)), GUILayout.Height(Ui(36f))))
+            GUILayout.Label("Choose one or more products to locate.", _helpStyle);
+            GUILayout.Space(Ui(8f));
+            for (int i = _manualSelections.Count - 1; i >= 0; i--)
             {
-                _manualSelections.RemoveAt(i);
-                GUI.changed = true;
+                ProductType type = _manualSelections[i];
+                ProductData data = GetProductData(type);
+                GUILayout.BeginHorizontal(_tileStyle, GUILayout.Height(Ui(72f)));
+                DrawProductImage(data != null ? data.productSprite : null, Ui(54f));
+                GUILayout.BeginVertical();
+                GUILayout.Label(GetProductName(type, data), _selectedNameStyle);
+                GUILayout.Label(GetProductBrand(data), _brandStyle);
+                GUILayout.EndVertical();
+                if (GUILayout.Button("Remove", _buttonStyle, GUILayout.Width(Ui(92f)), GUILayout.Height(Ui(36f))))
+                {
+                    _manualSelections.RemoveAt(i);
+                    GUI.changed = true;
+                }
+                GUILayout.EndHorizontal();
+                GUILayout.Space(Ui(6f));
             }
-            GUILayout.EndHorizontal();
-            GUILayout.Space(Ui(6f));
         }
         GUILayout.Space(Ui(12f));
         GUILayout.Label("API REQUESTS", _sectionStyle);
@@ -127,38 +133,50 @@ public sealed partial class ProductLocatorPlugin
                 ProductLocatorApi.GetRequestedProductsForSource(source, _apiRequestProducts);
                 GUILayout.BeginVertical(_tileStyle);
                 GUILayout.BeginHorizontal();
-                GUILayout.Label(source, _selectedNameStyle, GUILayout.ExpandWidth(true));
+                bool expanded;
+                if (!_apiSourceExpanded.TryGetValue(source, out expanded))
+                    expanded = true;
+                string sourceHeader = (expanded ? "▾  " : "▸  ") + source + "  ·  " +
+                    _apiRequestProducts.Count;
+                if (GUILayout.Button(sourceHeader, _selectedNameStyle, GUILayout.ExpandWidth(true),
+                    GUILayout.Height(Ui(38f))))
+                    _apiSourceExpanded[source] = !expanded;
                 if (GUILayout.Button("Clear all", _buttonStyle, GUILayout.Width(Ui(96f)), GUILayout.Height(Ui(32f))))
                 {
                     ProductLocatorApi.Clear(source);
+                    _apiSourceExpanded.Remove(source);
                     _apiRequestSources.RemoveAt(i);
                     _apiRequestProducts.Clear();
                     i--;
                 }
                 GUILayout.EndHorizontal();
-                for (int productIndex = 0; productIndex < _apiRequestProducts.Count; productIndex++)
+                if (expanded)
                 {
-                    ProductType type = _apiRequestProducts[productIndex];
-                    ProductData data = GetProductData(type);
-                    GUILayout.BeginHorizontal(_tileStyle, GUILayout.Height(Ui(72f)));
-                    DrawProductImage(data != null ? data.productSprite : null, Ui(54f));
-                    GUILayout.BeginVertical();
-                    GUILayout.Label(GetProductName(type, data), _selectedNameStyle, GUILayout.ExpandWidth(true));
-                    GUILayout.Label(GetProductBrand(data), _brandStyle, GUILayout.ExpandWidth(true));
-                    GUILayout.EndVertical();
-                    if (GUILayout.Button("Remove", _buttonStyle, GUILayout.Width(Ui(92f)), GUILayout.Height(Ui(36f))))
+                    for (int productIndex = 0; productIndex < _apiRequestProducts.Count; productIndex++)
                     {
-                        ProductLocatorApi.RemoveHighlight(source, type);
-                        _apiRequestProducts.RemoveAt(productIndex);
-                        productIndex--;
-                        if (_apiRequestProducts.Count == 0)
+                        ProductType type = _apiRequestProducts[productIndex];
+                        ProductData data = GetProductData(type);
+                        GUILayout.BeginHorizontal(_tileStyle, GUILayout.Height(Ui(72f)));
+                        DrawProductImage(data != null ? data.productSprite : null, Ui(54f));
+                        GUILayout.BeginVertical();
+                        GUILayout.Label(GetProductName(type, data), _selectedNameStyle, GUILayout.ExpandWidth(true));
+                        GUILayout.Label(GetProductBrand(data), _brandStyle, GUILayout.ExpandWidth(true));
+                        GUILayout.EndVertical();
+                        if (GUILayout.Button("Remove", _buttonStyle, GUILayout.Width(Ui(92f)), GUILayout.Height(Ui(36f))))
                         {
-                            _apiRequestSources.RemoveAt(i);
-                            i--;
+                            ProductLocatorApi.RemoveHighlight(source, type);
+                            _apiRequestProducts.RemoveAt(productIndex);
+                            productIndex--;
+                            if (_apiRequestProducts.Count == 0)
+                            {
+                                _apiSourceExpanded.Remove(source);
+                                _apiRequestSources.RemoveAt(i);
+                                i--;
+                            }
                         }
+                        GUILayout.EndHorizontal();
+                        GUILayout.Space(Ui(6f));
                     }
-                    GUILayout.EndHorizontal();
-                    GUILayout.Space(Ui(6f));
                 }
                 GUILayout.EndVertical();
                 GUILayout.Space(Ui(6f));

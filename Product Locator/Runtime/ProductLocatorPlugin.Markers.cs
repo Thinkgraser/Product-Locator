@@ -71,7 +71,11 @@ public sealed partial class ProductLocatorPlugin
             float iconPadding = Mathf.Clamp(iconSize * 0.16f, 7f, 18f);
             view.Root.sizeDelta = new Vector2(iconSize, iconSize);
             view.Root.anchoredPosition = new Vector2(x - Screen.width * 0.5f, Screen.height * 0.5f - y);
-            view.Background.color = new Color(0.035f, 0.045f, 0.065f, Mathf.Clamp01(_backgroundOpacity.Value));
+            float? requestedBackgroundOpacity;
+            float backgroundOpacity = _activeTargetBackgroundOpacities.TryGetValue(target.ProductType,
+                out requestedBackgroundOpacity) && requestedBackgroundOpacity.HasValue
+                ? requestedBackgroundOpacity.Value : _backgroundOpacity.Value;
+            view.Background.color = new Color(0.035f, 0.045f, 0.065f, Mathf.Clamp01(backgroundOpacity));
             Color markerColor = target.MarkerColor.HasValue ? target.MarkerColor.Value : _markerColor.Value;
             view.BorderTop.color = markerColor;
             view.BorderBottom.color = markerColor;
