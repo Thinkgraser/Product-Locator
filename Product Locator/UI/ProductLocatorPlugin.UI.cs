@@ -10,6 +10,13 @@ using UnityEngine.SceneManagement;
 
 public sealed partial class ProductLocatorPlugin
 {
+    private static readonly Dictionary<ProductGroup, string> DepartmentNames =
+        new Dictionary<ProductGroup, string>();
+    private readonly Dictionary<ProductType, string> _productTypeSearchNames =
+        new Dictionary<ProductType, string>();
+    private string _normalizedSearchSource;
+    private string _normalizedSearch = string.Empty;
+
     private void OnGUI()
     {
         DrawShelfIcons();
@@ -402,10 +409,23 @@ public sealed partial class ProductLocatorPlugin
         if (string.IsNullOrEmpty(_search))
             return true;
 
-        string query = _search.Trim();
-        return GetProductName(type, data).IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0 ||
-               GetProductBrand(data).IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0 ||
-               type.ToString().IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0;
+        if (!string.Equals(_normalizedSearchSource, _search, StringComparison.Ordinal))
+        {
+            _normalizedSearchSource = _search;
+            _normalizedSearch = _search.Trim();
+        }
+
+        if (GetProductName(type, data).IndexOf(_normalizedSearch, StringComparison.OrdinalIgnoreCase) >= 0 ||
+            GetProductBrand(data).IndexOf(_normalizedSearch, StringComparison.OrdinalIgnoreCase) >= 0)
+            return true;
+
+        string typeName;
+        if (!_productTypeSearchNames.TryGetValue(type, out typeName))
+        {
+            typeName = type.ToString();
+            _productTypeSearchNames[type] = typeName;
+        }
+        return typeName.IndexOf(_normalizedSearch, StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private ProductData GetProductData(ProductType type)
@@ -580,16 +600,22 @@ public sealed partial class ProductLocatorPlugin
 
     private static string FormatDepartment(ProductGroup group)
     {
+        string name;
+        if (DepartmentNames.TryGetValue(group, out name))
+            return name;
+
         string value = group.ToString();
-        return value.Length > 0 ? char.ToUpperInvariant(value[0]) + value.Substring(1).ToLowerInvariant() : value;
+        name = value.Length > 0 ? char.ToUpperInvariant(value[0]) + value.Substring(1).ToLowerInvariant() : value;
+        DepartmentNames[group] = name;
+        return name;
     }
 
     private void EnsureGuiStyles()
     {
-        float scale = GetUiScale();
-        if (_titleStyle != null && Mathf.Approximately(scale, _styledUiScale))
+        // GUI.matrix scales the picker, including these styles. Their values do
+        // not change with UI scale, so keep the styles and native textures.
+        if (_titleStyle != null)
             return;
-        _styledUiScale = scale;
 
         _titleStyle = new GUIStyle(GUI.skin.label)
         {

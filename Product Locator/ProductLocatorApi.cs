@@ -11,14 +11,26 @@ public sealed class ProductLocatorHighlightOptions
     /// <summary>Maximum nearest product types from this source. Null shows all requested products.</summary>
     public int? MaxProductsPerSource { get; set; }
 
-    /// <summary>Optional marker border color. Null inherits the user's configured color.</summary>
+    /// <summary>Optional marker border color while the shelf is occluded. Null inherits the user's configured color.</summary>
     public Color? MarkerColor { get; set; }
+
+    /// <summary>Optional marker border color when the shelf is in clear view and within three times interaction range. Null inherits the user's configured visible color.</summary>
+    public Color? VisibleMarkerColor { get; set; }
 
     /// <summary>Optional opacity of the dark marker background, from 0 (transparent) to 1 (opaque). Null inherits the user's configured opacity.</summary>
     public float? BackgroundOpacity { get; set; }
 
+    /// <summary>Optional marker background color, including alpha. Null inherits the user's configured background color.</summary>
+    public Color? BackgroundColor { get; set; }
+
+    /// <summary>Optional marker background color when the shelf is in clear view and within three times interaction range. Null inherits the user's configured visible background color.</summary>
+    public Color? VisibleBackgroundColor { get; set; }
+
     /// <summary>Whether to show empty labeled shelves. Null inherits the user's configuration.</summary>
     public bool? IncludeEmptyShelves { get; set; }
+
+    /// <summary>Whether to show the marker's distance from the player. Null inherits the user's configuration.</summary>
+    public bool? ShowDistance { get; set; }
 }
 
 /// <summary>
@@ -35,8 +47,12 @@ public static class ProductLocatorApi
         public readonly List<ProductType> Products = new List<ProductType>();
         public readonly Dictionary<ProductType, int?> Limits = new Dictionary<ProductType, int?>();
         public readonly Dictionary<ProductType, Color?> Colors = new Dictionary<ProductType, Color?>();
+        public readonly Dictionary<ProductType, Color?> VisibleColors = new Dictionary<ProductType, Color?>();
+        public readonly Dictionary<ProductType, Color?> VisibleBackgroundColors = new Dictionary<ProductType, Color?>();
         public readonly Dictionary<ProductType, float?> BackgroundOpacities = new Dictionary<ProductType, float?>();
+        public readonly Dictionary<ProductType, Color?> BackgroundColors = new Dictionary<ProductType, Color?>();
         public readonly Dictionary<ProductType, bool?> IncludeEmptyShelves = new Dictionary<ProductType, bool?>();
+        public readonly Dictionary<ProductType, bool?> ShowDistance = new Dictionary<ProductType, bool?>();
         public int? MaxProductsPerSource;
     }
 
@@ -84,7 +100,7 @@ public static class ProductLocatorApi
 
     /// <summary>
     /// Adds or updates one product for this source without replacing its other products.
-    /// Null options use unlimited shelves and inherit the user's color and empty-shelf settings.
+    /// Null options use unlimited shelves and inherit the user's marker colors and empty-shelf settings.
     /// A MaxProductsPerSource value in options applies to the source's complete product request.
     /// </summary>
     public static void AddHighlight(ProductType productType, string source = "External",
@@ -93,6 +109,7 @@ public static class ProductLocatorApi
         int? maxShelvesPerProduct = options != null ? options.MaxShelvesPerProduct : (int?)null;
         int? maxProductsPerSource = options != null ? options.MaxProductsPerSource : (int?)null;
         float? backgroundOpacity = options != null ? options.BackgroundOpacity : (float?)null;
+        Color? backgroundColor = options != null ? options.BackgroundColor : (Color?)null;
         ValidateShelfLimit(maxShelvesPerProduct);
         ValidateProductLimit(maxProductsPerSource);
         ValidateBackgroundOpacity(backgroundOpacity);
@@ -108,23 +125,39 @@ public static class ProductLocatorApi
             }
             int? previousLimit;
             Color? previousColor;
+            Color? previousVisibleColor;
+            Color? previousVisibleBackgroundColor;
             float? previousBackgroundOpacity;
+            Color? previousBackgroundColor;
             bool? previousIncludeEmpty;
+            bool? previousShowDistance;
             request.Limits.TryGetValue(productType, out previousLimit);
             request.Colors.TryGetValue(productType, out previousColor);
+            request.VisibleColors.TryGetValue(productType, out previousVisibleColor);
+            request.VisibleBackgroundColors.TryGetValue(productType, out previousVisibleBackgroundColor);
             request.BackgroundOpacities.TryGetValue(productType, out previousBackgroundOpacity);
+            request.BackgroundColors.TryGetValue(productType, out previousBackgroundColor);
             request.IncludeEmptyShelves.TryGetValue(productType, out previousIncludeEmpty);
+            request.ShowDistance.TryGetValue(productType, out previousShowDistance);
             bool changed = !request.Limits.ContainsKey(productType) || previousLimit != maxShelvesPerProduct ||
                 previousColor != (options != null ? options.MarkerColor : (Color?)null) ||
+                previousVisibleColor != (options != null ? options.VisibleMarkerColor : (Color?)null) ||
+                previousVisibleBackgroundColor != (options != null ? options.VisibleBackgroundColor : (Color?)null) ||
                 previousBackgroundOpacity != backgroundOpacity ||
+                previousBackgroundColor != backgroundColor ||
                 previousIncludeEmpty != (options != null ? options.IncludeEmptyShelves : (bool?)null) ||
+                previousShowDistance != (options != null ? options.ShowDistance : (bool?)null) ||
                 (options != null && request.MaxProductsPerSource != maxProductsPerSource);
             if (!request.Limits.ContainsKey(productType))
                 request.Products.Add(productType);
             request.Limits[productType] = maxShelvesPerProduct;
             request.Colors[productType] = options != null ? options.MarkerColor : (Color?)null;
+            request.VisibleColors[productType] = options != null ? options.VisibleMarkerColor : (Color?)null;
+            request.VisibleBackgroundColors[productType] = options != null ? options.VisibleBackgroundColor : (Color?)null;
             request.BackgroundOpacities[productType] = backgroundOpacity;
+            request.BackgroundColors[productType] = backgroundColor;
             request.IncludeEmptyShelves[productType] = options != null ? options.IncludeEmptyShelves : (bool?)null;
+            request.ShowDistance[productType] = options != null ? options.ShowDistance : (bool?)null;
             if (options != null)
                 request.MaxProductsPerSource = maxProductsPerSource;
             if (changed)
@@ -135,7 +168,7 @@ public static class ProductLocatorApi
     /// <summary>
     /// Atomically replaces this caller's highlights with the supplied products and shared options.
     /// Passing an empty or null sequence clears this caller's request. Null options use unlimited shelves
-    /// and inherit the user's color and empty-shelf settings. MaxProductsPerSource selects that many
+    /// and inherit the user's marker colors and empty-shelf settings. MaxProductsPerSource selects that many
     /// nearest stocked product types from this source's list.
     /// </summary>
     public static void SetHighlights(string source, IEnumerable<ProductType> productTypes,
@@ -146,9 +179,13 @@ public static class ProductLocatorApi
         ValidateShelfLimit(maxShelvesPerProduct);
         ValidateProductLimit(maxProductsPerSource);
         Color? markerColor = options != null ? options.MarkerColor : (Color?)null;
+        Color? visibleMarkerColor = options != null ? options.VisibleMarkerColor : (Color?)null;
+        Color? visibleBackgroundColor = options != null ? options.VisibleBackgroundColor : (Color?)null;
         float? backgroundOpacity = options != null ? options.BackgroundOpacity : (float?)null;
+        Color? backgroundColor = options != null ? options.BackgroundColor : (Color?)null;
         ValidateBackgroundOpacity(backgroundOpacity);
         bool? includeEmptyShelves = options != null ? options.IncludeEmptyShelves : (bool?)null;
+        bool? showDistance = options != null ? options.ShowDistance : (bool?)null;
         source = NormalizeSource(source);
         List<ProductType> products = new List<ProductType>();
         if (productTypes != null)
@@ -185,8 +222,12 @@ public static class ProductLocatorApi
                 request.Products.Add(productType);
                 request.Limits[productType] = maxShelvesPerProduct;
                 request.Colors[productType] = markerColor;
+                request.VisibleColors[productType] = visibleMarkerColor;
+                request.VisibleBackgroundColors[productType] = visibleBackgroundColor;
                 request.BackgroundOpacities[productType] = backgroundOpacity;
+                request.BackgroundColors[productType] = backgroundColor;
                 request.IncludeEmptyShelves[productType] = includeEmptyShelves;
+                request.ShowDistance[productType] = showDistance;
             }
             if (!hadRequest || !RequestsEqual(previousRequest, request))
                 RequestVersion++;
@@ -225,18 +266,35 @@ public static class ProductLocatorApi
             int? secondLimit;
             Color? firstColor;
             Color? secondColor;
+            Color? firstVisibleColor;
+            Color? secondVisibleColor;
+            Color? firstVisibleBackgroundColor;
+            Color? secondVisibleBackgroundColor;
             float? firstOpacity;
             float? secondOpacity;
+            Color? firstBackgroundColor;
+            Color? secondBackgroundColor;
             bool? firstEmpty;
             bool? secondEmpty;
+            bool? firstShowDistance;
+            bool? secondShowDistance;
             if (second.Products[i] != type || !first.Limits.TryGetValue(type, out firstLimit) ||
                 !second.Limits.TryGetValue(type, out secondLimit) || firstLimit != secondLimit ||
                 !first.Colors.TryGetValue(type, out firstColor) || !second.Colors.TryGetValue(type, out secondColor) ||
                 firstColor != secondColor ||
+                !first.VisibleColors.TryGetValue(type, out firstVisibleColor) ||
+                !second.VisibleColors.TryGetValue(type, out secondVisibleColor) || firstVisibleColor != secondVisibleColor ||
+                !first.VisibleBackgroundColors.TryGetValue(type, out firstVisibleBackgroundColor) ||
+                !second.VisibleBackgroundColors.TryGetValue(type, out secondVisibleBackgroundColor) ||
+                firstVisibleBackgroundColor != secondVisibleBackgroundColor ||
                 !first.BackgroundOpacities.TryGetValue(type, out firstOpacity) ||
                 !second.BackgroundOpacities.TryGetValue(type, out secondOpacity) || firstOpacity != secondOpacity ||
+                !first.BackgroundColors.TryGetValue(type, out firstBackgroundColor) ||
+                !second.BackgroundColors.TryGetValue(type, out secondBackgroundColor) || firstBackgroundColor != secondBackgroundColor ||
                 !first.IncludeEmptyShelves.TryGetValue(type, out firstEmpty) ||
-                !second.IncludeEmptyShelves.TryGetValue(type, out secondEmpty) || firstEmpty != secondEmpty)
+                !second.IncludeEmptyShelves.TryGetValue(type, out secondEmpty) || firstEmpty != secondEmpty ||
+                !first.ShowDistance.TryGetValue(type, out firstShowDistance) ||
+                !second.ShowDistance.TryGetValue(type, out secondShowDistance) || firstShowDistance != secondShowDistance)
                 return false;
         }
         return true;
@@ -292,8 +350,12 @@ public static class ProductLocatorApi
                 return false;
             request.Limits.Remove(productType);
             request.Colors.Remove(productType);
+            request.VisibleColors.Remove(productType);
+            request.VisibleBackgroundColors.Remove(productType);
             request.BackgroundOpacities.Remove(productType);
+            request.BackgroundColors.Remove(productType);
             request.IncludeEmptyShelves.Remove(productType);
+            request.ShowDistance.Remove(productType);
             RequestVersion++;
 
             if (request.Products.Count == 0)
@@ -432,6 +494,51 @@ public static class ProductLocatorApi
         Dictionary<ProductType, bool?> includeEmptyShelves,
         Dictionary<ProductType, float?> backgroundOpacities)
     {
+        GetRequestedProducts(productTypes, limits, colors, includeEmptyShelves, backgroundOpacities, null);
+    }
+
+    internal static void GetRequestedProducts(List<ProductType> productTypes,
+        Dictionary<ProductType, int?> limits, Dictionary<ProductType, Color?> colors,
+        Dictionary<ProductType, bool?> includeEmptyShelves,
+        Dictionary<ProductType, float?> backgroundOpacities,
+        Dictionary<ProductType, Color?> visibleColors)
+    {
+        GetRequestedProducts(productTypes, limits, colors, includeEmptyShelves, backgroundOpacities,
+            visibleColors, null);
+    }
+
+    internal static long GetRequestedProducts(List<ProductType> productTypes,
+        Dictionary<ProductType, int?> limits, Dictionary<ProductType, Color?> colors,
+        Dictionary<ProductType, bool?> includeEmptyShelves,
+        Dictionary<ProductType, float?> backgroundOpacities,
+        Dictionary<ProductType, Color?> visibleColors,
+        Dictionary<ProductType, Color?> visibleBackgroundColors)
+    {
+        return GetRequestedProducts(productTypes, limits, colors, includeEmptyShelves,
+            backgroundOpacities, visibleColors, visibleBackgroundColors, null);
+    }
+
+    internal static long GetRequestedProducts(List<ProductType> productTypes,
+        Dictionary<ProductType, int?> limits, Dictionary<ProductType, Color?> colors,
+        Dictionary<ProductType, bool?> includeEmptyShelves,
+        Dictionary<ProductType, float?> backgroundOpacities,
+        Dictionary<ProductType, Color?> visibleColors,
+        Dictionary<ProductType, Color?> visibleBackgroundColors,
+        Dictionary<ProductType, bool?> showDistance)
+    {
+        return GetRequestedProducts(productTypes, limits, colors, includeEmptyShelves,
+            backgroundOpacities, visibleColors, visibleBackgroundColors, showDistance, null);
+    }
+
+    internal static long GetRequestedProducts(List<ProductType> productTypes,
+        Dictionary<ProductType, int?> limits, Dictionary<ProductType, Color?> colors,
+        Dictionary<ProductType, bool?> includeEmptyShelves,
+        Dictionary<ProductType, float?> backgroundOpacities,
+        Dictionary<ProductType, Color?> visibleColors,
+        Dictionary<ProductType, Color?> visibleBackgroundColors,
+        Dictionary<ProductType, bool?> showDistance,
+        Dictionary<ProductType, Color?> backgroundColors)
+    {
         productTypes.Clear();
         if (limits != null)
             limits.Clear();
@@ -441,6 +548,14 @@ public static class ProductLocatorApi
             includeEmptyShelves.Clear();
         if (backgroundOpacities != null)
             backgroundOpacities.Clear();
+        if (visibleColors != null)
+            visibleColors.Clear();
+        if (visibleBackgroundColors != null)
+            visibleBackgroundColors.Clear();
+        if (showDistance != null)
+            showDistance.Clear();
+        if (backgroundColors != null)
+            backgroundColors.Clear();
         lock (Sync)
         {
             RequestProductScratch.Clear();
@@ -455,12 +570,20 @@ public static class ProductLocatorApi
                     ProductType productType = request.Products[productIndex];
                     int? requestLimit;
                     Color? requestColor;
+                    Color? requestVisibleColor;
+                    Color? requestVisibleBackgroundColor;
                     bool? requestIncludeEmpty;
+                    bool? requestShowDistance;
                     float? requestBackgroundOpacity;
+                    Color? requestBackgroundColor;
                     request.Limits.TryGetValue(productType, out requestLimit);
                     request.Colors.TryGetValue(productType, out requestColor);
+                    request.VisibleColors.TryGetValue(productType, out requestVisibleColor);
+                    request.VisibleBackgroundColors.TryGetValue(productType, out requestVisibleBackgroundColor);
                     request.IncludeEmptyShelves.TryGetValue(productType, out requestIncludeEmpty);
+                    request.ShowDistance.TryGetValue(productType, out requestShowDistance);
                     request.BackgroundOpacities.TryGetValue(productType, out requestBackgroundOpacity);
+                    request.BackgroundColors.TryGetValue(productType, out requestBackgroundColor);
                     if (RequestProductScratch.Add(productType))
                     {
                         productTypes.Add(productType);
@@ -472,6 +595,14 @@ public static class ProductLocatorApi
                             includeEmptyShelves[productType] = requestIncludeEmpty;
                         if (backgroundOpacities != null)
                             backgroundOpacities[productType] = requestBackgroundOpacity;
+                        if (visibleColors != null)
+                            visibleColors[productType] = requestVisibleColor;
+                        if (visibleBackgroundColors != null)
+                            visibleBackgroundColors[productType] = requestVisibleBackgroundColor;
+                        if (showDistance != null)
+                            showDistance[productType] = requestShowDistance;
+                        if (backgroundColors != null)
+                            backgroundColors[productType] = requestBackgroundColor;
                     }
                     else if (limits != null)
                     {
@@ -490,14 +621,30 @@ public static class ProductLocatorApi
                     if (backgroundOpacities != null && !backgroundOpacities[productType].HasValue && requestBackgroundOpacity.HasValue)
                         backgroundOpacities[productType] = requestBackgroundOpacity;
 
+                    if (visibleColors != null && !visibleColors[productType].HasValue && requestVisibleColor.HasValue)
+                        visibleColors[productType] = requestVisibleColor;
+
+                    if (visibleBackgroundColors != null && !visibleBackgroundColors[productType].HasValue &&
+                        requestVisibleBackgroundColor.HasValue)
+                        visibleBackgroundColors[productType] = requestVisibleBackgroundColor;
+
                     if (includeEmptyShelves != null && requestIncludeEmpty.HasValue)
                     {
                         bool? existingIncludeEmpty = includeEmptyShelves[productType];
                         if (!existingIncludeEmpty.HasValue || requestIncludeEmpty.Value)
                             includeEmptyShelves[productType] = requestIncludeEmpty;
                     }
+
+                    if (showDistance != null && !showDistance[productType].HasValue && requestShowDistance.HasValue)
+                        showDistance[productType] = requestShowDistance;
+
+                    if (backgroundColors != null && !backgroundColors[productType].HasValue && requestBackgroundColor.HasValue)
+                        backgroundColors[productType] = requestBackgroundColor;
                 }
             }
+            // Return the version covered by this snapshot while still holding
+            // the lock, so a concurrent request is noticed on the next Update.
+            return RequestVersion;
         }
     }
 

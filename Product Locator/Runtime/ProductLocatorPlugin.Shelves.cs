@@ -12,6 +12,17 @@ public sealed partial class ProductLocatorPlugin
 {
     private static readonly Vector3 EscalatorTopLanding = new Vector3(134.638f, 9.263f, 233.134f);
     private static readonly Vector3 EscalatorBottomLanding = new Vector3(137.509f, 1.484f, 246.541f);
+    // Cached-index application is synchronous on Unity's main thread. The
+    // background coroutines keep separate scan state across their yields.
+    private readonly HashSet<ProductType> _shelfSelectionTypes = new HashSet<ProductType>();
+    private readonly List<ShelfIconTarget> _shelfSelectionTargets = new List<ShelfIconTarget>();
+    private readonly Dictionary<ProductType, List<ShelfIconTarget>> _limitedShelfSelectionTargets =
+        new Dictionary<ProductType, List<ShelfIconTarget>>();
+    private readonly Dictionary<ProductType, List<float>> _limitedShelfSelectionDistances =
+        new Dictionary<ProductType, List<float>>();
+    private readonly Dictionary<Shelf, int> _shelfSelectionStacks = new Dictionary<Shelf, int>();
+    private readonly HashSet<ProductType> _shelfIndexAddedProducts = new HashSet<ProductType>();
+    private readonly List<Renderer> _shelfRendererScratch = new List<Renderer>();
 
     private void RefreshShelfTargets()
     {
@@ -32,8 +43,9 @@ public sealed partial class ProductLocatorPlugin
         if (targetTypes == null || targetTypes.Count == 0)
             return;
 
-        LogDebug("Refreshing marker targets [" + string.Join(", ", targetTypes) +
-            "]; indexReady=" + _shelfIndexReady + "; explicitShelfScan=" + forceShelfScan + ".");
+        if (DebugLoggingEnabled)
+            LogDebug("Refreshing marker targets [" + string.Join(", ", targetTypes) +
+                "]; indexReady=" + _shelfIndexReady + "; explicitShelfScan=" + forceShelfScan + ".");
 
         if (_shelfIndexReady && !forceShelfScan)
         {
@@ -49,7 +61,6 @@ public sealed partial class ProductLocatorPlugin
             StopCoroutine(_shelfRefreshRoutine);
         Dictionary<ProductType, int?> limits = new Dictionary<ProductType, int?>();
         Dictionary<ProductType, Color?> colors = new Dictionary<ProductType, Color?>();
-        Dictionary<ProductType, float?> backgroundOpacities = new Dictionary<ProductType, float?>();
         Dictionary<ProductType, bool> includeEmptyShelves = new Dictionary<ProductType, bool>();
         for (int i = 0; i < targetTypes.Count; i++)
         {
@@ -62,20 +73,16 @@ public sealed partial class ProductLocatorPlugin
             Color? markerColor;
             colors[targetTypes[i]] = _activeTargetColors.TryGetValue(targetTypes[i], out markerColor)
                 ? markerColor : (Color?)null;
-            float? backgroundOpacity;
-            backgroundOpacities[targetTypes[i]] = _activeTargetBackgroundOpacities.TryGetValue(targetTypes[i], out backgroundOpacity)
-                ? backgroundOpacity : (float?)null;
             bool includeEmpty;
             includeEmptyShelves[targetTypes[i]] = _activeTargetIncludeEmptyShelves.TryGetValue(targetTypes[i], out includeEmpty) && includeEmpty;
         }
         _shelfRefreshRoutine = StartCoroutine(RefreshShelfTargetsIncrementally(
-            new List<ProductType>(targetTypes), limits, colors, backgroundOpacities, includeEmptyShelves));
+            new List<ProductType>(targetTypes), limits, colors, includeEmptyShelves));
         _nextRefresh = Time.unscaledTime + 1.5f;
     }
 
     private IEnumerator RefreshShelfTargetsIncrementally(List<ProductType> targetTypes,
         Dictionary<ProductType, int?> limits, Dictionary<ProductType, Color?> colors,
-        Dictionary<ProductType, float?> backgroundOpacities,
         Dictionary<ProductType, bool> includeEmptyShelves)
     {
         float scanStartedAt = Time.unscaledTime;
@@ -85,7 +92,6 @@ public sealed partial class ProductLocatorPlugin
 
         List<ShelfIconTarget> refreshedTargets = new List<ShelfIconTarget>();
         Dictionary<ProductType, List<ShelfIconTarget>> refreshedIndex = new Dictionary<ProductType, List<ShelfIconTarget>>();
-        Dictionary<ProductType, Color?> indexColors = new Dictionary<ProductType, Color?>();
         for (int i = 0; i < targetTypes.Count; i++)
             refreshedIndex[targetTypes[i]] = new List<ShelfIconTarget>();
         HashSet<ProductType> addedTypes = new HashSet<ProductType>();
@@ -93,8 +99,8 @@ public sealed partial class ProductLocatorPlugin
         HashSet<ProductType> targetSet = new HashSet<ProductType>(targetTypes);
         Dictionary<ProductType, List<ShelfIconTarget>> limitedTargets = new Dictionary<ProductType, List<ShelfIconTarget>>();
         Dictionary<ProductType, List<float>> limitedDistances = new Dictionary<ProductType, List<float>>();
-        Camera camera = Camera.main;
-        Vector3 closestOrigin = camera != null ? camera.transform.position : Vector3.zero;
+        HashSet<int> scannedShelfInstanceIds = new HashSet<int>();
+        Vector3 closestOrigin = GetShelfRankingOrigin();
 
         for (int i = 0; i < _shelves.Length; i++)
         {
@@ -104,6 +110,14 @@ public sealed partial class ProductLocatorPlugin
             {
                 if (i % shelvesPerFrame == shelvesPerFrame - 1)
                     yield return null;
+                continue;
+            }
+
+            if (!scannedShelfInstanceIds.Add(shelf.GetInstanceID()))
+            {
+                if (DebugLoggingEnabled)
+                    LogDebug("Skipping duplicate shelf reference during marker scan: '" + shelf.name +
+                        "' (ID " + shelf.ShelfID + ", instance " + shelf.GetInstanceID() + ").");
                 continue;
             }
 
@@ -134,7 +148,7 @@ public sealed partial class ProductLocatorPlugin
 
                     ShelfIconTarget target = CreateShelfIconTarget(shelf, bounds, icon, iconsOnShelf++, product.Data.type, colors);
                     AddToShelfIndex(refreshedIndex, CreateShelfIconTarget(shelf, bounds, icon, 0,
-                        product.Data.type, indexColors));
+                        product.Data.type, null));
                     AddShelfIconTarget(target, limits, closestOrigin, refreshedTargets, limitedTargets, limitedDistances);
                 }
             }
@@ -165,7 +179,7 @@ public sealed partial class ProductLocatorPlugin
                                 ShelfIconTarget target = CreateShelfIconTarget(shelf, bounds, icon,
                                     iconsOnShelf, assignedType, colors);
                                 ShelfIconTarget indexedEmpty = CreateShelfIconTarget(shelf, bounds, icon, 0,
-                                    assignedType, indexColors);
+                                    assignedType, null);
                                 indexedEmpty.IsEmptyShelf = true;
                                 AddToShelfIndex(refreshedIndex, indexedEmpty);
                                 AddShelfIconTarget(target, limits, closestOrigin, refreshedTargets,
@@ -189,6 +203,9 @@ public sealed partial class ProductLocatorPlugin
         foreach (KeyValuePair<ProductType, List<ShelfIconTarget>> item in limitedTargets)
             refreshedTargets.AddRange(item.Value);
 
+        if (DebugLoggingEnabled)
+            LogDebug("Shelf scan selected marker(s): " + DescribeShelfTargets(refreshedTargets) + ".");
+
         foreach (KeyValuePair<ProductType, List<ShelfIconTarget>> item in refreshedIndex)
             _shelfTargetIndex[item.Key] = item.Value;
 
@@ -201,32 +218,29 @@ public sealed partial class ProductLocatorPlugin
         _shelfTargets.AddRange(refreshedTargets);
         _shelfRefreshRoutine = null;
         _nextRefresh = Time.unscaledTime + 1.5f;
-        LogDebug("Shelf refresh completed for [" + string.Join(", ", targetTypes) + "] with " +
-            refreshedTargets.Count + " marker(s) in " + (Time.unscaledTime - scanStartedAt).ToString("0.00") + "s.");
+        if (DebugLoggingEnabled)
+            LogDebug("Shelf refresh completed for [" + string.Join(", ", targetTypes) + "] with " +
+                refreshedTargets.Count + " marker(s) in " + (Time.unscaledTime - scanStartedAt).ToString("0.00") + "s.");
     }
 
     private void ApplyShelfIndex(IList<ProductType> targetTypes)
     {
-        Dictionary<ProductType, int?> limits = new Dictionary<ProductType, int?>();
-        Dictionary<ProductType, Color?> colors = new Dictionary<ProductType, Color?>();
-        Dictionary<ProductType, bool> includeEmpty = new Dictionary<ProductType, bool>();
-        HashSet<ProductType> targetSet = new HashSet<ProductType>(targetTypes);
+        HashSet<ProductType> targetSet = _shelfSelectionTypes;
+        targetSet.Clear();
         for (int i = 0; i < targetTypes.Count; i++)
-        {
-            int? limit;
-            limits[targetTypes[i]] = _activeTargetLimits.TryGetValue(targetTypes[i], out limit) ? limit : null;
-            Color? color;
-            colors[targetTypes[i]] = _activeTargetColors.TryGetValue(targetTypes[i], out color) ? color : (Color?)null;
-            bool showEmpty;
-            includeEmpty[targetTypes[i]] = _activeTargetIncludeEmptyShelves.TryGetValue(targetTypes[i], out showEmpty) && showEmpty;
-        }
+            targetSet.Add(targetTypes[i]);
 
-        List<ShelfIconTarget> selected = new List<ShelfIconTarget>();
-        Dictionary<ProductType, List<ShelfIconTarget>> limited = new Dictionary<ProductType, List<ShelfIconTarget>>();
-        Dictionary<ProductType, List<float>> distances = new Dictionary<ProductType, List<float>>();
-        Dictionary<Shelf, int> shelfStacks = new Dictionary<Shelf, int>();
-        Camera camera = Camera.main;
-        Vector3 origin = camera != null ? camera.transform.position : Vector3.zero;
+        List<ShelfIconTarget> selected = _shelfSelectionTargets;
+        selected.Clear();
+        Dictionary<ProductType, List<ShelfIconTarget>> limited = _limitedShelfSelectionTargets;
+        Dictionary<ProductType, List<float>> distances = _limitedShelfSelectionDistances;
+        foreach (List<ShelfIconTarget> targets in limited.Values)
+            targets.Clear();
+        foreach (List<float> productDistances in distances.Values)
+            productDistances.Clear();
+        Dictionary<Shelf, int> shelfStacks = _shelfSelectionStacks;
+        shelfStacks.Clear();
+        Vector3 origin = GetShelfRankingOrigin();
         for (int i = 0; i < targetTypes.Count; i++)
         {
             List<ShelfIconTarget> indexed;
@@ -239,11 +253,12 @@ public sealed partial class ProductLocatorPlugin
                     continue;
                 bool showEmpty;
                 if (cached.IsEmptyShelf &&
-                    (!includeEmpty.TryGetValue(cached.ProductType, out showEmpty) || !showEmpty))
+                    (!_activeTargetIncludeEmptyShelves.TryGetValue(cached.ProductType, out showEmpty) || !showEmpty))
                     continue;
                 int stackIndex;
                 shelfStacks.TryGetValue(cached.Shelf, out stackIndex);
                 shelfStacks[cached.Shelf] = stackIndex + 1;
+                Color? markerColor;
                 ShelfIconTarget target = new ShelfIconTarget
                 {
                     Shelf = cached.Shelf,
@@ -252,20 +267,52 @@ public sealed partial class ProductLocatorPlugin
                     Uv = cached.Uv,
                     StackIndex = stackIndex,
                     ProductType = cached.ProductType,
-                    MarkerColor = colors[cached.ProductType]
+                    MarkerColor = _activeTargetColors.TryGetValue(cached.ProductType, out markerColor)
+                        ? markerColor : (Color?)null,
+                    IsEmptyShelf = cached.IsEmptyShelf
                 };
-                AddShelfIconTarget(target, limits, origin, selected, limited, distances);
+                AddShelfIconTarget(target, _activeTargetLimits, origin, selected, limited, distances);
             }
         }
 
-        foreach (KeyValuePair<ProductType, List<ShelfIconTarget>> item in limited)
-            selected.AddRange(item.Value);
+        for (int i = 0; i < targetTypes.Count; i++)
+        {
+            List<ShelfIconTarget> limitedProductTargets;
+            if (limited.TryGetValue(targetTypes[i], out limitedProductTargets))
+                selected.AddRange(limitedProductTargets);
+        }
+        if (DebugLoggingEnabled)
+            LogDebug("Cached index selected marker(s): " + DescribeShelfTargets(selected) + ".");
         for (int i = _shelfTargets.Count - 1; i >= 0; i--)
         {
             if (targetSet.Contains(_shelfTargets[i].ProductType))
                 _shelfTargets.RemoveAt(i);
         }
         _shelfTargets.AddRange(selected);
+        // Release references after copying; keep the collection capacities for
+        // the next refresh without retaining removed shelf objects.
+        selected.Clear();
+        shelfStacks.Clear();
+        foreach (List<ShelfIconTarget> targets in limited.Values)
+            targets.Clear();
+    }
+
+    private static string DescribeShelfTargets(IList<ShelfIconTarget> targets)
+    {
+        if (targets == null || targets.Count == 0)
+            return "none";
+
+        List<string> descriptions = new List<string>(targets.Count);
+        for (int i = 0; i < targets.Count; i++)
+        {
+            ShelfIconTarget target = targets[i];
+            if (target == null || target.Shelf == null)
+                continue;
+            descriptions.Add(target.ProductType + " on '" + target.Shelf.name + "' (ID " +
+                target.Shelf.ShelfID + ", instance " + target.Shelf.GetInstanceID() + ")" +
+                (target.IsEmptyShelf ? " [empty]" : string.Empty));
+        }
+        return descriptions.Count == 0 ? "none" : string.Join("; ", descriptions);
     }
 
     private ShelfIconTarget CreateShelfIconTarget(Shelf shelf, Bounds bounds, Sprite icon, int stackIndex,
@@ -280,7 +327,8 @@ public sealed partial class ProductLocatorPlugin
             Uv = GetSpriteUv(icon),
             StackIndex = stackIndex,
             ProductType = productType,
-            MarkerColor = colors.TryGetValue(productType, out markerColor) ? markerColor : (Color?)null
+            MarkerColor = colors != null && colors.TryGetValue(productType, out markerColor)
+                ? markerColor : (Color?)null
         };
     }
 
@@ -324,26 +372,48 @@ public sealed partial class ProductLocatorPlugin
         }
     }
 
+    private Vector3 GetShelfRankingOrigin()
+    {
+        Camera camera = Camera.main;
+        Vector3 position = camera != null ? camera.transform.position : Vector3.zero;
+        // Camera bob and small look/aim offsets should not make a limited shelf
+        // selection oscillate between nearly equidistant shelves. Re-rank after
+        // the player has moved a meaningful distance instead.
+        const float movementThreshold = 0.75f;
+        if (!_hasShelfRankingOrigin || (position - _shelfRankingOrigin).sqrMagnitude >=
+            movementThreshold * movementThreshold)
+        {
+            _shelfRankingOrigin = position;
+            _hasShelfRankingOrigin = true;
+        }
+        return _shelfRankingOrigin;
+    }
+
     private bool CacheShelves()
     {
         Shelf[] foundShelves = FindObjectsByType<Shelf>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
         // Keep the scene scan canonical in case the same shelf is exposed twice.
-        HashSet<Shelf> uniqueShelves = new HashSet<Shelf>();
+        HashSet<int> uniqueShelfInstanceIds = new HashSet<int>();
         List<Shelf> uniqueResults = new List<Shelf>(foundShelves.Length);
         for (int i = 0; i < foundShelves.Length; i++)
         {
             Shelf shelf = foundShelves[i];
-            if (shelf != null && uniqueShelves.Add(shelf))
+            if (shelf != null && uniqueShelfInstanceIds.Add(shelf.GetInstanceID()))
                 uniqueResults.Add(shelf);
         }
         foundShelves = uniqueResults.ToArray();
         bool changed = foundShelves.Length != _shelves.Length;
         if (!changed)
         {
-            HashSet<Shelf> currentShelves = new HashSet<Shelf>(_shelves);
+            HashSet<int> currentShelfInstanceIds = new HashSet<int>();
+            for (int i = 0; i < _shelves.Length; i++)
+            {
+                if (_shelves[i] != null)
+                    currentShelfInstanceIds.Add(_shelves[i].GetInstanceID());
+            }
             for (int i = 0; i < foundShelves.Length; i++)
             {
-                if (!currentShelves.Contains(foundShelves[i]))
+                if (!currentShelfInstanceIds.Contains(foundShelves[i].GetInstanceID()))
                 {
                     changed = true;
                     break;
@@ -355,7 +425,8 @@ public sealed partial class ProductLocatorPlugin
             return false;
 
         _shelves = foundShelves;
-        LogDebug("Shelf cache changed; now tracking " + foundShelves.Length + " shelf(s).");
+        if (DebugLoggingEnabled)
+            LogDebug("Shelf cache changed; now tracking " + foundShelves.Length + " shelf(s).");
         _shelfBounds.Clear();
         _shelfIndexReady = false;
         _shelfTargetIndex.Clear();
@@ -369,12 +440,12 @@ public sealed partial class ProductLocatorPlugin
     private IEnumerator BuildShelfIndexIncrementally(Shelf[] shelves)
     {
         float buildStartedAt = Time.unscaledTime;
-        LogDebug("Starting background shelf index build for " + shelves.Length + " shelf(s).");
+        if (DebugLoggingEnabled)
+            LogDebug("Starting background shelf index build for " + shelves.Length + " shelf(s).");
         yield return null;
         Dictionary<ProductType, List<ShelfIconTarget>> index =
             new Dictionary<ProductType, List<ShelfIconTarget>>();
         Dictionary<Shelf, ShelfSnapshot> snapshots = new Dictionary<Shelf, ShelfSnapshot>();
-        Dictionary<ProductType, Color?> noColors = new Dictionary<ProductType, Color?>();
         HashSet<ProductType> addedTypes = new HashSet<ProductType>();
         const int shelvesPerFrame = 8;
 
@@ -411,7 +482,7 @@ public sealed partial class ProductLocatorPlugin
                             hasBounds = true;
                         }
                         AddToShelfIndex(index, CreateShelfIconTarget(shelf, bounds, icon, 0,
-                            product.Data.type, noColors));
+                            product.Data.type, null));
                     }
                 }
 
@@ -434,7 +505,7 @@ public sealed partial class ProductLocatorPlugin
                                     _shelfBounds[shelf] = bounds;
                                 }
                                 ShelfIconTarget target = CreateShelfIconTarget(shelf, bounds, icon, 0,
-                                    assigned, noColors);
+                                    assigned, null);
                                 target.IsEmptyShelf = true;
                                 AddToShelfIndex(index, target);
                             }
@@ -459,12 +530,15 @@ public sealed partial class ProductLocatorPlugin
             _shelfSnapshots[item.Key] = item.Value;
         _shelfIndexReady = true;
         _shelfIndexBuildRoutine = null;
-        int indexedShelfEntries = 0;
-        foreach (KeyValuePair<ProductType, List<ShelfIconTarget>> item in _shelfTargetIndex)
-            indexedShelfEntries += item.Value.Count;
-        LogDebug("Shelf index ready: " + _shelfTargetIndex.Count + " product type(s), " +
-            indexedShelfEntries + " shelf entry/entries in " +
-            (Time.unscaledTime - buildStartedAt).ToString("0.00") + "s.");
+        if (DebugLoggingEnabled)
+        {
+            int indexedShelfEntries = 0;
+            foreach (KeyValuePair<ProductType, List<ShelfIconTarget>> item in _shelfTargetIndex)
+                indexedShelfEntries += item.Value.Count;
+            LogDebug("Shelf index ready: " + _shelfTargetIndex.Count + " product type(s), " +
+                indexedShelfEntries + " shelf entry/entries in " +
+                (Time.unscaledTime - buildStartedAt).ToString("0.00") + "s.");
+        }
         if (_activeTargets.Count > 0)
             RefreshShelfTargets(_activeTargets);
     }
@@ -497,9 +571,10 @@ public sealed partial class ProductLocatorPlugin
     private void PopulateShelfSnapshot(ShelfSnapshot snapshot, Shelf shelf, List<Product> available)
     {
         snapshot.StockedProducts.Clear();
-        snapshot.Position = shelf.transform.position;
-        snapshot.Rotation = shelf.transform.rotation;
-        snapshot.Scale = shelf.transform.lossyScale;
+        Transform shelfTransform = shelf.transform;
+        snapshot.Position = shelfTransform.position;
+        snapshot.Rotation = shelfTransform.rotation;
+        snapshot.Scale = shelfTransform.lossyScale;
         snapshot.LabeledProduct = ProductType.NONE;
         snapshot.EmptyLabelProduct = ProductType.NONE;
         if (available != null)
@@ -534,6 +609,8 @@ public sealed partial class ProductLocatorPlugin
     {
         const int shelvesPerFrame = 8;
         const float idleSecondsBetweenPasses = 0.75f;
+        HashSet<ProductType> affectedProducts = new HashSet<ProductType>();
+        List<ProductType> visibleAffected = new List<ProductType>();
         while (true)
         {
             if (!_shelfIndexReady)
@@ -543,7 +620,7 @@ public sealed partial class ProductLocatorPlugin
             }
 
             Shelf[] shelves = _shelves;
-            HashSet<ProductType> affectedProducts = new HashSet<ProductType>();
+            affectedProducts.Clear();
             bool productCatalogChanged = false;
             for (int i = 0; i < shelves.Length; i++)
             {
@@ -581,11 +658,13 @@ public sealed partial class ProductLocatorPlugin
                     if (current.EmptyLabelProduct != ProductType.NONE)
                         affectedProducts.Add(current.EmptyLabelProduct);
 
-                    ShelfSnapshot stored = CloneShelfSnapshot(current);
+                    ShelfSnapshot stored = previous ?? new ShelfSnapshot();
+                    CopyShelfSnapshot(current, stored);
                     UpdateShelfIndexEntry(shelf, available, stored, affectedProducts);
                     _shelfSnapshots[shelf] = stored;
-                    LogDebug("Shelf changed: '" + shelf.name + "' (ID " + shelf.ShelfID +
-                        "); affected products: " + string.Join(", ", affectedProducts) + ".");
+                    if (DebugLoggingEnabled)
+                        LogDebug("Shelf changed: '" + shelf.name + "' (ID " + shelf.ShelfID +
+                            "); affected products: " + string.Join(", ", affectedProducts) + ".");
                 }
 
                 if (i % shelvesPerFrame == shelvesPerFrame - 1)
@@ -600,7 +679,7 @@ public sealed partial class ProductLocatorPlugin
 
             if (affectedProducts.Count > 0 && _shelfIndexReady)
             {
-                List<ProductType> visibleAffected = new List<ProductType>();
+                visibleAffected.Clear();
                 for (int i = 0; i < _activeTargets.Count; i++)
                 {
                     if (affectedProducts.Contains(_activeTargets[i]))
@@ -619,6 +698,9 @@ public sealed partial class ProductLocatorPlugin
         const float discoveryInterval = 2f;
         const int shelvesPerFrame = 8;
         ProductType[] productTypes = (ProductType[])Enum.GetValues(typeof(ProductType));
+        HashSet<int> knownShelfInstanceIds = new HashSet<int>();
+        List<Shelf> newlyDiscovered = new List<Shelf>();
+        HashSet<ProductType> newlyDiscoveredProducts = new HashSet<ProductType>();
         if (_labeledShelfRegistryField == null)
             _labeledShelfRegistryField = typeof(LabeledStockManager).GetField(
                 "allLabeledShelvesByProductType", BindingFlags.Instance | BindingFlags.NonPublic);
@@ -634,9 +716,14 @@ public sealed partial class ProductLocatorPlugin
             if (registry == null)
                 continue;
 
-            HashSet<Shelf> knownShelves = new HashSet<Shelf>(_shelves);
-            List<Shelf> newlyDiscovered = new List<Shelf>();
-            HashSet<ProductType> newlyDiscoveredProducts = new HashSet<ProductType>();
+            knownShelfInstanceIds.Clear();
+            for (int i = 0; i < _shelves.Length; i++)
+            {
+                if (_shelves[i] != null)
+                    knownShelfInstanceIds.Add(_shelves[i].GetInstanceID());
+            }
+            newlyDiscovered.Clear();
+            newlyDiscoveredProducts.Clear();
             int inspectedShelves = 0;
             for (int productIndex = 0; productIndex < productTypes.Length; productIndex++)
             {
@@ -652,15 +739,16 @@ public sealed partial class ProductLocatorPlugin
                 {
                     Shelf shelf = restockables[shelfIndex] as Shelf;
                     if (shelf != null && shelf.isActiveAndEnabled &&
-                        shelf.gameObject.activeInHierarchy && knownShelves.Add(shelf))
+                        shelf.gameObject.activeInHierarchy && knownShelfInstanceIds.Add(shelf.GetInstanceID()))
                     {
                         newlyDiscovered.Add(shelf);
                         newlyDiscoveredProducts.Add(productType);
                         if (_loggedShelfInstanceIds.Add(shelf.GetInstanceID()))
                         {
-                            LogDebug("Detected new shelf '" + shelf.name + "' (ID " +
-                                shelf.ShelfID + ") for product " + productType +
-                                "; adding it to the product index.");
+                            if (DebugLoggingEnabled)
+                                LogDebug("Detected new shelf '" + shelf.name + "' (ID " +
+                                    shelf.ShelfID + ") for product " + productType +
+                                    "; adding it to the product index.");
                         }
                     }
 
@@ -670,13 +758,13 @@ public sealed partial class ProductLocatorPlugin
                 }
             }
 
-            if (newlyDiscovered.Count > 0)
+            if (DebugLoggingEnabled && newlyDiscovered.Count > 0)
             {
                 LogDebug("Shelf registry discovery checked " + inspectedShelves + " labeled shelf reference(s); " +
                     newlyDiscovered.Count + " new shelf(s) found for product(s): " +
                     string.Join(", ", newlyDiscoveredProducts) + ".");
             }
-            else
+            else if (DebugLoggingEnabled)
             {
                 LogDebug("Shelf registry discovery checked " + inspectedShelves +
                     " labeled shelf reference(s); no new shelves found.");
@@ -684,17 +772,28 @@ public sealed partial class ProductLocatorPlugin
 
             if (newlyDiscovered.Count > 0)
             {
-                Shelf[] expandedShelves = new Shelf[_shelves.Length + newlyDiscovered.Count];
-                Array.Copy(_shelves, expandedShelves, _shelves.Length);
-                newlyDiscovered.CopyTo(expandedShelves, _shelves.Length);
-                _shelves = expandedShelves;
+                List<Shelf> expandedShelves = new List<Shelf>(_shelves.Length + newlyDiscovered.Count);
+                HashSet<int> expandedInstanceIds = new HashSet<int>();
+                for (int i = 0; i < _shelves.Length; i++)
+                {
+                    Shelf existingShelf = _shelves[i];
+                    if (existingShelf != null && expandedInstanceIds.Add(existingShelf.GetInstanceID()))
+                        expandedShelves.Add(existingShelf);
+                }
+                for (int i = 0; i < newlyDiscovered.Count; i++)
+                {
+                    Shelf newShelf = newlyDiscovered[i];
+                    if (newShelf != null && expandedInstanceIds.Add(newShelf.GetInstanceID()))
+                        expandedShelves.Add(newShelf);
+                }
+                _shelves = expandedShelves.ToArray();
                 _shelfBounds.Clear();
                 _shelfIndexReady = false;
                 _shelfTargetIndex.Clear();
                 _shelfSnapshots.Clear();
                 if (_shelfIndexBuildRoutine != null)
                     StopCoroutine(_shelfIndexBuildRoutine);
-                _shelfIndexBuildRoutine = StartCoroutine(BuildShelfIndexIncrementally(expandedShelves));
+                _shelfIndexBuildRoutine = StartCoroutine(BuildShelfIndexIncrementally(_shelves));
                 CacheStoreProductTypes();
                 CacheProductData();
             }
@@ -721,18 +820,15 @@ public sealed partial class ProductLocatorPlugin
         return true;
     }
 
-    private static ShelfSnapshot CloneShelfSnapshot(ShelfSnapshot source)
+    private static void CopyShelfSnapshot(ShelfSnapshot source, ShelfSnapshot destination)
     {
-        ShelfSnapshot copy = new ShelfSnapshot
-        {
-            Position = source.Position,
-            Rotation = source.Rotation,
-            Scale = source.Scale,
-            LabeledProduct = source.LabeledProduct,
-            EmptyLabelProduct = source.EmptyLabelProduct
-        };
-        copy.StockedProducts.UnionWith(source.StockedProducts);
-        return copy;
+        destination.Position = source.Position;
+        destination.Rotation = source.Rotation;
+        destination.Scale = source.Scale;
+        destination.LabeledProduct = source.LabeledProduct;
+        destination.EmptyLabelProduct = source.EmptyLabelProduct;
+        destination.StockedProducts.Clear();
+        destination.StockedProducts.UnionWith(source.StockedProducts);
     }
 
     private void UpdateShelfIndexEntry(Shelf shelf, List<Product> available, ShelfSnapshot snapshot,
@@ -743,13 +839,17 @@ public sealed partial class ProductLocatorPlugin
             List<ShelfIconTarget> targets;
             if (!_shelfTargetIndex.TryGetValue(type, out targets))
                 continue;
-            targets.RemoveAll(target => target.Shelf == shelf);
+            for (int i = targets.Count - 1; i >= 0; i--)
+            {
+                if (targets[i].Shelf == shelf)
+                    targets.RemoveAt(i);
+            }
         }
 
         Bounds bounds = GetShelfBounds(shelf);
         _shelfBounds[shelf] = bounds;
-        HashSet<ProductType> added = new HashSet<ProductType>();
-        Dictionary<ProductType, Color?> noColors = new Dictionary<ProductType, Color?>();
+        HashSet<ProductType> added = _shelfIndexAddedProducts;
+        added.Clear();
         if (available != null)
         {
             for (int i = 0; i < available.Count; i++)
@@ -761,7 +861,7 @@ public sealed partial class ProductLocatorPlugin
                 Sprite icon = product.Data.productSprite;
                 if (icon != null && icon.texture != null)
                     AddToShelfIndex(_shelfTargetIndex, CreateShelfIconTarget(shelf, bounds, icon, 0,
-                        product.Data.type, noColors));
+                        product.Data.type, null));
             }
         }
 
@@ -773,7 +873,7 @@ public sealed partial class ProductLocatorPlugin
             if (icon != null && icon.texture != null)
             {
                 ShelfIconTarget target = CreateShelfIconTarget(shelf, bounds, icon, 0,
-                    snapshot.EmptyLabelProduct, noColors);
+                    snapshot.EmptyLabelProduct, null);
                 target.IsEmptyShelf = true;
                 AddToShelfIndex(_shelfTargetIndex, target);
             }
@@ -811,6 +911,8 @@ public sealed partial class ProductLocatorPlugin
 
     private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
     {
+        _markerVisibilityByShelf.Clear();
+        _hasShelfRankingOrigin = false;
         CacheComputerUiRaycasters();
         bool shelvesChanged = CacheShelves();
         CacheStoreProductTypes();
@@ -874,9 +976,8 @@ public sealed partial class ProductLocatorPlugin
         return preferCurrentFloor ? nearestSameFloor ?? nearestAnyFloor : nearestAnyFloor;
     }
 
-    private void UpdateApiDisplayedTargets()
+    private void UpdateApiDisplayedTargets(long requestVersion)
     {
-        long requestVersion = ProductLocatorApi.GetRequestVersion();
         if (requestVersion == _apiProductRequestVersion)
             return;
 
@@ -1090,12 +1191,31 @@ public sealed partial class ProductLocatorPlugin
         return true;
     }
 
-    private static Bounds GetShelfBounds(Shelf shelf)
+    private static bool AreNullableBoolSettingsEqual(
+        Dictionary<ProductType, bool?> first,
+        Dictionary<ProductType, bool?> second,
+        IList<ProductType> productTypes)
     {
-        Renderer[] renderers = shelf.GetComponentsInChildren<Renderer>();
+        for (int i = 0; i < productTypes.Count; i++)
+        {
+            bool? firstValue;
+            bool? secondValue;
+            if (!first.TryGetValue(productTypes[i], out firstValue) ||
+                !second.TryGetValue(productTypes[i], out secondValue) || firstValue != secondValue)
+                return false;
+        }
+
+        return true;
+    }
+
+    private Bounds GetShelfBounds(Shelf shelf)
+    {
+        List<Renderer> renderers = _shelfRendererScratch;
+        renderers.Clear();
+        shelf.GetComponentsInChildren<Renderer>(false, renderers);
         bool found = false;
         Bounds bounds = new Bounds(shelf.transform.position, Vector3.zero);
-        for (int i = 0; i < renderers.Length; i++)
+        for (int i = 0; i < renderers.Count; i++)
         {
             Renderer renderer = renderers[i];
             if (renderer == null || !renderer.gameObject.activeInHierarchy)
@@ -1110,6 +1230,7 @@ public sealed partial class ProductLocatorPlugin
                 bounds.Encapsulate(renderer.bounds);
         }
 
+        renderers.Clear();
         return found ? bounds : new Bounds(shelf.transform.position, Vector3.one);
     }
 

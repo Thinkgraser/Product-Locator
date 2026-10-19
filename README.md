@@ -49,7 +49,7 @@ ProductLocatorApi.SetHighlights("MyPlugin", requestedProducts, options);
 
 ## Highlight options
 
-All option properties are optional and can be combined freely. Unset properties use their defaults: no shelf limit, the user's configured marker color, and the user's empty-shelf setting.
+All option properties are optional and can be combined freely. Unset properties use their defaults: no shelf limit, the user's configured marker and background colors, and the user's empty-shelf setting.
 
 ```csharp
 ProductLocatorApi.AddHighlight(ProductType.MILK, "MyPlugin",
@@ -57,8 +57,11 @@ ProductLocatorApi.AddHighlight(ProductType.MILK, "MyPlugin",
     {
         MaxShelvesPerProduct = 1,
         MarkerColor = Color.cyan,
-        BackgroundOpacity = 0.8f,
-        IncludeEmptyShelves = true
+        VisibleMarkerColor = Color.green,
+        BackgroundColor = new Color(0.035f, 0.045f, 0.065f, 0.8f),
+        VisibleBackgroundColor = new Color(0.02f, 0.12f, 0.15f, 0.8f),
+        IncludeEmptyShelves = true,
+        ShowDistance = true
     });
 
 ProductLocatorApi.AddHighlight(ProductType.BREAD, "MyPlugin",
@@ -79,11 +82,13 @@ The selected product types are ranked when the source request changes. They do n
 ProductLocatorApi.RefreshProductSelections();
 ```
 
-`MarkerColor` optionally sets the marker border color. `BackgroundOpacity` optionally sets the dark background opacity from `0` (transparent) to `1` (opaque). `IncludeEmptyShelves` optionally controls markers on empty shelves that still have a product label. Set any property to `null` or leave it unset to inherit the user's configuration.
+`MarkerColor` optionally sets the marker border color while the shelf is occluded or outside the visible-color range. `VisibleMarkerColor` optionally sets the marker border color when the shelf is in clear view and within three times the game's interaction range. `BackgroundColor` sets the normal marker background color, and `VisibleBackgroundColor` sets it under those same clear-view conditions. Both colors include alpha: `0` is transparent and `1` is fully opaque. `IncludeEmptyShelves` optionally controls markers on empty shelves that still have a product label. `ShowDistance` optionally enables or disables the distance label on that product's markers. Set any property to `null` or leave it unset to inherit the user's configuration.
+
+**Background color change:** The old `Background Opacity` config setting has been replaced by `Icon Background Color`; its alpha controls opacity. API callers should use `BackgroundColor` and, when needed, `VisibleBackgroundColor`. `BackgroundOpacity` remains available for existing callers and overrides the active background color's alpha. Integrations supporting older Product Locator versions can fall back to `BackgroundOpacity` when `BackgroundColor` is unavailable; older versions cannot apply a custom background RGB color.
 
 `SetHighlights` applies one shared options object to every product in the source's replacement list. Use `AddHighlight` when different products from the same source need different options.
 
-If multiple sources request the same product, the first explicitly supplied marker color and background opacity are used; otherwise the user's configured settings are used. Shelf limits are merged using the least restrictive request. Empty labeled shelves are included if any source requesting that product explicitly enables them; otherwise an explicit setting is used, falling back to the user's configuration when no source specifies one. Manual selections in the picker (F6 by default) take precedence for products selected there.
+If multiple sources request the same product, the first explicitly supplied occluded marker color, visible marker color, normal background color, visible background color, background opacity, and distance-label setting are used; otherwise the user's configured settings are used. Shelf limits are merged using the least restrictive request. Empty labeled shelves are included if any source requesting that product explicitly enables them; otherwise an explicit setting is used, falling back to the user's configuration when no source specifies one. Manual selections in the picker (F6 by default) take precedence for products selected there.
 
 ## Removing requests
 
